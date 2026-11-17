@@ -1,0 +1,82 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+.env/
+.venv/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Local config
+.env.local
+*.local
+
+# PySide6 / Qt
+*.qrc.py
+*.ui.py
+*.moc.cpp
+*.moc.hpp
+
+# Build artifacts
+*.so
+*.dylib
+*.dll
+
+# Test coverage
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model weights (large files)
+*.pt
+*.pth
+*.onnx
+*.bin
+
+# AnnotationEngine specific
+annotation_engine.db
+annotation_engine.db-journal
+annotation_engine.db-shm
+annotation_engine.db-wal
+
+# User data
+annotation_engine_data/
+models/
+*.pt
+*.onnx
+*.bin
+
+# IDE specific
+*.code-workspace

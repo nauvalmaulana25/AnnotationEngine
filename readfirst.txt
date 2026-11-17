@@ -1,0 +1,8 @@
+please use this venv
+
+source /home/nauval/Documents/'auto annotator'/venv/bin/activate
+
+aerox kentut
+source "/home/nauval/Documents/auto annotator/venv/bin/activate"
+cd /home/nauval/Documents/Annotation_Engine
+python -m annotation_engine.main

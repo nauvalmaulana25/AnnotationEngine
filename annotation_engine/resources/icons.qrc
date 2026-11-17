@@ -1,0 +1,8 @@
+<!DOCTYPE RCC><RCC version="1.0">
+<qresource>
+    <file>icons/close.svg</file>
+    <file>icons/maximize.svg</file>
+    <file>icons/chevron-down.svg</file>
+    <file>icons/check.svg</file>
+</qresource>
+</RCC>
