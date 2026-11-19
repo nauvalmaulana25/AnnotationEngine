@@ -24,6 +24,7 @@ APP_DATA_DIR = get_app_data_dir()
 MODELS_DIR = APP_DATA_DIR / 'models'
 PROJECTS_DIR = Path.home() / 'Documents' / 'AnnotationEngine' / 'Projects'
 LOGS_DIR = APP_DATA_DIR / 'logs'
+ICONS_DIR = Path(__file__).parent / 'resources' / 'icons'
 
 # Ensure directories exist
 for d in [APP_DATA_DIR, MODELS_DIR, PROJECTS_DIR, LOGS_DIR]:
@@ -67,6 +68,13 @@ COLORS = {
     'green_500': '#22c55e', 'blue_500': '#3b82f6', 'purple_500': '#a855f7',
 }
 
+# High-contrast palette used for annotation shapes (cycled per label)
+ANNOTATION_COLORS = [
+    '#ef4444', '#3b82f6', '#22c55e', '#f59e0b', '#a855f7',
+    '#06b6d4', '#ec4899', '#84cc16', '#f97316', '#6366f1',
+    '#14b8a6', '#eab308',
+]
+
 # Annotation settings
 ANNOTATION_SETTINGS = {
     'max_undo_steps': 50,
@@ -108,7 +116,6 @@ TOOL_NAMES = {
     'bbox': 'rect',
     'polygon': 'polygon',
     'keypoint': 'point',
-    'pan': 'pan',
 }
 
 # Keyboard shortcuts
@@ -117,7 +124,6 @@ SHORTCUTS = {
     'tool_bbox': 'B',
     'tool_polygon': 'P',
     'tool_keypoint': 'K',
-    'tool_pan': 'H',
     'delete': 'Del',
     'escape': 'Esc',
     'undo': 'Ctrl+Z',

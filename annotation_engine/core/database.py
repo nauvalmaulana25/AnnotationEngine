@@ -69,6 +69,15 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT NOT NULL
 );
 
+-- Project label metadata (colors, visibility)
+CREATE TABLE IF NOT EXISTS project_labels (
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    color TEXT NOT NULL,
+    visible INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (project_id, name)
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_images_project ON images(project_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_project ON jobs(project_id);
@@ -208,6 +217,7 @@ def clean_database() -> bool:
     with db.get_connection() as conn:
         # Delete all data from tables
         conn.execute("DELETE FROM annotations")
+        conn.execute("DELETE FROM project_labels")
         conn.execute("DELETE FROM images")
         conn.execute("DELETE FROM jobs")
         conn.execute("DELETE FROM projects")
@@ -309,6 +319,138 @@ def delete_annotation(image_id: int) -> bool:
     db = get_database()
     cursor = db.execute("DELETE FROM annotations WHERE image_id = ?", (image_id,))
     return cursor.rowcount > 0
+
+# Project label metadata
+def get_project_labels(project_id: int) -> List[Dict]:
+    """Return persisted label metadata for a project."""
+    db = get_database()
+    rows = db.fetch_all(
+        "SELECT name, color, visible FROM project_labels "
+        "WHERE project_id = ? ORDER BY rowid",
+        (project_id,)
+    )
+    return [
+        {
+            'name': row['name'],
+            'color': row['color'],
+            'visible': bool(row['visible']),
+        }
+        for row in rows
+    ]
+
+def save_project_labels(project_id: int, labels: List[Dict]) -> None:
+    """Replace the persisted label metadata for a project."""
+    db = get_database()
+    with db.get_connection() as conn:
+        conn.execute(
+            "DELETE FROM project_labels WHERE project_id = ?", (project_id,)
+        )
+        conn.executemany(
+            "INSERT INTO project_labels (project_id, name, color, visible) "
+            "VALUES (?, ?, ?, ?)",
+            [
+                (
+                    project_id,
+                    label['name'],
+                    label.get('color') or '',
+                    1 if label.get('visible', True) else 0,
+                )
+                for label in labels
+                if label.get('name')
+            ]
+        )
+        conn.commit()
+
+def label_in_use(
+    project_id: int, label: str, exclude_image_id: Optional[int] = None
+) -> bool:
+    """Return whether any saved annotation of the project uses the label.
+
+    ``exclude_image_id`` skips one image, used for the canvas that is currently
+    open: while it has unsaved edits its saved row is stale and must not keep a
+    label alive.
+    """
+    if not label:
+        return False
+
+    db = get_database()
+    base_sql = """
+        SELECT a.data
+        FROM annotations a
+        JOIN images i ON i.id = a.image_id
+        WHERE i.project_id = ?
+    """
+    base_params: List[Any] = [project_id]
+    if exclude_image_id is not None:
+        base_sql += " AND a.image_id != ?"
+        base_params.append(exclude_image_id)
+
+    try:
+        row = db.fetch_one(
+            base_sql
+            + """
+              AND EXISTS (
+                  SELECT 1 FROM json_each(a.data, '$.shapes') AS shape
+                  WHERE json_extract(shape.value, '$.label') = ?
+              )
+            """,
+            tuple(base_params) + (label,)
+        )
+        return bool(row)
+    except sqlite3.OperationalError:
+        # SQLite without the JSON1 extension: inspect the rows in Python.
+        for row in db.fetch_all(base_sql, tuple(base_params)):
+            try:
+                data = json.loads(row['data'])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if any(
+                (shape or {}).get('label') == label
+                for shape in data.get('shapes') or []
+            ):
+                return True
+        return False
+
+
+def rename_label_in_project(project_id: int, old: str, new: str) -> int:
+    """Rename a label inside every saved annotation of a project."""
+    if not old or not new or old == new:
+        return 0
+
+    db = get_database()
+    rows = db.fetch_all(
+        """SELECT a.id, a.image_id, a.data FROM annotations a
+           JOIN images i ON i.id = a.image_id
+           WHERE i.project_id = ?""",
+        (project_id,)
+    )
+
+    updated = 0
+    with db.get_connection() as conn:
+        for row in rows:
+            try:
+                data = json.loads(row['data'])
+            except (TypeError, json.JSONDecodeError):
+                continue
+
+            shapes = data.get('shapes') or []
+            changed = False
+            for shape in shapes:
+                if shape.get('label') == old:
+                    shape['label'] = new
+                    changed = True
+            if not changed:
+                continue
+
+            now = datetime.now().isoformat()
+            conn.execute(
+                "UPDATE annotations SET data = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(data), now, row['id'])
+            )
+            updated += 1
+        conn.commit()
+
+    return updated
 
 # Job CRUD
 def create_job(project_id: int, job_type: str, payload: Dict) -> str:

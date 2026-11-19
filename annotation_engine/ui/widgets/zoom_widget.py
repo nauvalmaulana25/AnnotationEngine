@@ -15,6 +15,7 @@ class ZoomWidget(QWidget):
         super().__init__(parent)
         
         self.canvas = canvas
+        self._updating = False
         self.setupUI()
     
     def setupUI(self):
@@ -61,7 +62,8 @@ class ZoomWidget(QWidget):
             "75%", "100%", "150%", "200%", "300%", "400%"
         ])
         self.zoom_combo.setCurrentText("100%")
-        self.zoom_combo.lineEdit().returnPressed.connect(self.onZoomTextEntered)
+        self.zoom_combo.activated.connect(self.onZoomComboActivated)
+        self.zoom_combo.lineEdit().editingFinished.connect(self.onZoomTextEntered)
         layout.addWidget(self.zoom_combo)
         
         # Zoom in button
@@ -79,13 +81,17 @@ class ZoomWidget(QWidget):
         layout.addWidget(self.fit_btn)
     
     def setZoom(self, zoom: float):
-        """Set zoom level."""
-        text = f"{int(zoom * 100)}%"
-        index = self.zoom_combo.findText(text)
-        if index >= 0:
-            self.zoom_combo.setCurrentIndex(index)
-        else:
-            self.zoom_combo.setCurrentText(text)
+        """Set the displayed zoom level without re-applying it."""
+        self._updating = True
+        try:
+            text = f"{int(round(zoom * 100))}%"
+            index = self.zoom_combo.findText(text)
+            if index >= 0:
+                self.zoom_combo.setCurrentIndex(index)
+            else:
+                self.zoom_combo.setCurrentText(text)
+        finally:
+            self._updating = False
     
     def zoomIn(self):
         """Zoom in."""
@@ -102,18 +108,45 @@ class ZoomWidget(QWidget):
         if self.canvas:
             self.canvas.zoomFit()
     
+    @Slot(int)
+    def onZoomComboActivated(self, index: int):
+        """Apply a zoom level chosen from the dropdown."""
+        if self._updating:
+            return
+        self._applyZoomText(self.zoom_combo.itemText(index))
+
     @Slot()
     def onZoomTextEntered(self):
         """Handle manual zoom text entry."""
-        text = self.zoom_combo.currentText()
+        if self._updating:
+            return
+        self._applyZoomText(self.zoom_combo.currentText())
+
+    def _applyZoomText(self, text: str):
+        zoom = self._parseZoom(text)
+        if zoom is None:
+            if self.canvas:
+                self.setZoom(self.canvas.scale)
+            return
+
+        if self.canvas:
+            self.canvas.setZoom(zoom)
+        else:
+            self.setZoom(zoom)
+        self.zoomChanged.emit(zoom)
+
+    @staticmethod
+    def _parseZoom(text: str) -> float | None:
+        text = (text or "").strip()
+        if not text:
+            return None
         try:
             if text.endswith('%'):
                 zoom = float(text[:-1]) / 100.0
             else:
-                zoom = float(text)
-            
-            if self.canvas:
-                # Would need to implement setZoom on canvas
-                pass
+                value = float(text)
+                # Treat bare values above 10 as percentages ("150" -> 1.5).
+                zoom = value / 100.0 if value > 10 else value
         except ValueError:
-            pass
+            return None
+        return zoom if zoom > 0 else None

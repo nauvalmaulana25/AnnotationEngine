@@ -8,6 +8,7 @@ from .export_dialog import ExportDialog
 from .settings_dialog import SettingsDialog
 from .auto_annotate import AutoAnnotateDialog
 from .progress_dialog import ProgressDialog
+from .rename_label import RenameLabelDialog
 
 __all__ = [
     'ProjectDialog',
@@ -17,4 +18,5 @@ __all__ = [
     'SettingsDialog',
     'AutoAnnotateDialog',
     'ProgressDialog',
+    'RenameLabelDialog',
 ]

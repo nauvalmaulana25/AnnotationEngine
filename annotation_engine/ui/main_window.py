@@ -8,7 +8,7 @@ from typing import Optional, List
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QSplitter, QDockWidget, QToolBar,
     QStatusBar, QMenuBar, QMenu, QFileDialog, QMessageBox,
-    QVBoxLayout, QLabel, QProgressBar, QDialog
+    QVBoxLayout, QLabel, QProgressBar, QDialog, QScrollArea, QFrame
 )
 from PySide6.QtCore import Qt, QSettings, QSize, Signal, Slot, QThread
 from PySide6.QtGui import QAction, QIcon, QKeySequence
@@ -20,8 +20,10 @@ from annotation_engine.config import (
 from annotation_engine.core.database import (
     get_database, create_project, get_project, get_all_projects,
     update_project, delete_project, get_project_images, add_image, get_image,
-    save_annotation, get_annotation, get_setting, set_setting,
-    add_recent_project, get_recent_projects, clean_database
+    update_image, save_annotation, get_annotation, get_setting, set_setting,
+    add_recent_project, get_recent_projects, clean_database,
+    get_project_labels, save_project_labels, rename_label_in_project,
+    label_in_use
 )
 from annotation_engine.ui.styles import get_application_stylesheet
 from annotation_engine.ui.widgets.image_grid import ImageGridWidget
@@ -37,6 +39,7 @@ from annotation_engine.ui.dialogs.export_dialog import ExportDialog
 from annotation_engine.ui.dialogs.settings_dialog import SettingsDialog
 from annotation_engine.ui.dialogs.auto_annotate import AutoAnnotateDialog
 from annotation_engine.ui.dialogs.progress_dialog import ProgressDialog
+from annotation_engine.ui.dialogs.rename_label import RenameLabelDialog
 from annotation_engine.ui.canvas import AnnotationCanvas
 from annotation_engine.ui.welcome_window import WelcomeWindow
 from annotation_engine.utils.encryption import EncryptionManager
@@ -65,6 +68,9 @@ class MainWindow(QMainWindow):
         self.current_image_id: Optional[int] = None
         self.current_tool: str = "select"
         self.annotations_dirty: bool = False
+        self._suspend_label_persistence: bool = False
+        self._label_counts: dict = {}
+        self._project_images: List[dict] = []
         
         # Services
         self.encryption = EncryptionManager()
@@ -101,6 +107,7 @@ class MainWindow(QMainWindow):
         
         # Toolbar
         self.toolbar = AnnotationToolbar(self)
+        self.toolbar.setObjectName("main_toolbar")
         self.addToolBar(Qt.TopToolBarArea, self.toolbar)
         
         # Main splitter (sidebar | canvas)
@@ -110,6 +117,7 @@ class MainWindow(QMainWindow):
         # Left sidebar
         self.sidebar = SidebarWidget(self)
         sidebar_dock = QDockWidget("Images", self)
+        sidebar_dock.setObjectName("images_dock")
         sidebar_dock.setWidget(self.sidebar)
         sidebar_dock.setFeatures(
             QDockWidget.DockWidgetClosable | 
@@ -122,6 +130,7 @@ class MainWindow(QMainWindow):
         # Right sidebar - Label list
         self.label_list = LabelListWidget(self)
         label_dock = QDockWidget("Labels", self)
+        label_dock.setObjectName("labels_dock")
         label_dock.setWidget(self.label_list)
         label_dock.setFeatures(
             QDockWidget.DockWidgetClosable | 
@@ -131,13 +140,20 @@ class MainWindow(QMainWindow):
         label_dock.setAllowedAreas(Qt.RightDockWidgetArea)
         self.addDockWidget(Qt.RightDockWidgetArea, label_dock)
         
-        # Canvas area
-        self.canvas = AnnotationCanvas(self)
-        self.main_splitter.addWidget(self.canvas)
+        # Canvas area. LabelMe 7.x requires a QScrollArea for panning,
+        # scrolling and zooming to work.
+        self.canvas = AnnotationCanvas()
+        self.canvas_scroll_area = QScrollArea()
+        self.canvas_scroll_area.setObjectName("canvas_scroll_area")
+        self.canvas_scroll_area.setFrameShape(QFrame.NoFrame)
+        self.canvas_scroll_area.setWidgetResizable(True)
+        self.canvas_scroll_area.setWidget(self.canvas)
+        self.main_splitter.addWidget(self.canvas_scroll_area)
         
-        # Zoom widget (floating over canvas)
-        self.zoom_widget = ZoomWidget(self.canvas)
+        # Zoom widget (floating over the canvas viewport)
+        self.zoom_widget = ZoomWidget(self.canvas, parent=self.canvas_scroll_area.viewport())
         self.zoom_widget.move(20, 20)
+        self.zoom_widget.raise_()
         
         # Status bar
         self.status_bar = AnnotationStatusBar(self)
@@ -167,6 +183,7 @@ class MainWindow(QMainWindow):
         self.toolbar.saveRequested.connect(self.saveAnnotation)
         self.toolbar.undoRequested.connect(self.undo)
         self.toolbar.redoRequested.connect(self.redo)
+        self.toolbar.deleteRequested.connect(self.deleteSelected)
         self.toolbar.welcomeRequested.connect(self.returnToWelcome)
         
         # Sidebar signals
@@ -180,10 +197,26 @@ class MainWindow(QMainWindow):
         self.canvas.shapeDeleted.connect(self.onShapeDeleted)
         self.canvas.selectionChanged.connect(self.onCanvasSelectionChanged)
         self.canvas.zoomChanged.connect(self.onZoomChanged)
+        self.canvas.historyChanged.connect(self.toolbar.setUndoRedoEnabled)
+        self.canvas.setLabelProvider(lambda: list(self.label_list.labels.keys()))
+        self.canvas.shapesChanged.connect(self.onCanvasShapesChanged)
+        if hasattr(self.canvas, "mouse_moved"):
+            self.canvas.mouse_moved.connect(self.onCanvasMouseMoved)
+        if hasattr(self.canvas, "status_updated"):
+            self.canvas.status_updated.connect(
+                lambda text: self.status_bar.showMessage(text, 3000)
+            )
         
         # Label list signals
         self.label_list.labelSelected.connect(self.onLabelSelected)
         self.label_list.labelVisibilityChanged.connect(self.onLabelVisibilityChanged)
+        self.label_list.labelColorChanged.connect(self.onLabelColorChanged)
+        self.label_list.selectShapesRequested.connect(self.onLabelSelectShapes)
+        self.label_list.deleteShapesRequested.connect(self.onLabelDeleteShapes)
+        self.label_list.removeLabelRequested.connect(self.onLabelRemove)
+        self.label_list.renameLabelRequested.connect(self.onLabelRename)
+        self.label_list.labelsChanged.connect(self._saveProjectLabels)
+        self.canvas.setLabelColors(self.label_list.getLabelColors())
         
         # Job queue signals
         self.job_queue.jobStarted.connect(self.onJobStarted)
@@ -261,14 +294,18 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(undo_action)
         
         redo_action = QAction("&Redo", self)
-        redo_action.setShortcut(QKeySequence.Redo)
+        redo_action.setShortcuts(
+            [QKeySequence.Redo, QKeySequence("Ctrl+Shift+Z")]
+        )
         redo_action.triggered.connect(self.redo)
         edit_menu.addAction(redo_action)
         
         edit_menu.addSeparator()
         
         delete_action = QAction("&Delete", self)
-        delete_action.setShortcut(QKeySequence.Delete)
+        delete_action.setShortcuts(
+            [QKeySequence(Qt.Key.Key_Delete), QKeySequence(Qt.Key.Key_Backspace)]
+        )
         delete_action.triggered.connect(self.deleteSelected)
         edit_menu.addAction(delete_action)
         
@@ -282,7 +319,7 @@ class MainWindow(QMainWindow):
         
         for tool_name, shortcut in [
             ("select", "V"), ("bbox", "B"), ("polygon", "P"),
-            ("keypoint", "K"), ("pan", "H")
+            ("keypoint", "K")
         ]:
             action = QAction(tool_name.capitalize(), self)
             action.setShortcut(QKeySequence(shortcut))
@@ -295,7 +332,7 @@ class MainWindow(QMainWindow):
         tools_menu.addSeparator()
         
         auto_annotate_action = QAction("&Auto Annotate...", self)
-        auto_annotate_action.setShortcut(QKeySequence("Ctrl+A"))
+        auto_annotate_action.setShortcut(QKeySequence("Ctrl+Shift+A"))
         auto_annotate_action.triggered.connect(self.showAutoAnnotate)
         tools_menu.addAction(auto_annotate_action)
         
@@ -330,7 +367,7 @@ class MainWindow(QMainWindow):
         
         zoom_fit = QAction("Zoom to &Fit", self)
         zoom_fit.setShortcut(QKeySequence("Ctrl+0"))
-        zoom_fit.triggered.connect(lambda: self.canvas.fitWindow())
+        zoom_fit.triggered.connect(lambda: self.canvas.zoomFit())
         view_menu.addAction(zoom_fit)
         
         # Settings menu
@@ -428,14 +465,23 @@ class MainWindow(QMainWindow):
         
         # Load images
         images = get_project_images(project_id)
+        self._project_images = images
         self.sidebar.setImages(images)
         
-        # Load labels from project (if any)
-        self.label_list.clear()
+        # Load persisted label metadata for this project.
+        self._suspend_label_persistence = True
+        try:
+            self.label_list.setLabels(get_project_labels(project_id))
+        finally:
+            self._suspend_label_persistence = False
+        self.canvas.setLabelColors(self.label_list.getLabelColors())
+        self._label_counts = {}
         
         # Clear canvas
         self.canvas.clear()
+        self.canvas.setTool(TOOL_NAMES[self.current_tool])
         self.current_image_id = None
+        self.status_bar.setShapeCount(0)
         
         # Update UI
         self.toolbar.setProjectLoaded(True)
@@ -458,9 +504,15 @@ class MainWindow(QMainWindow):
         
         self.current_project_id = None
         self.current_image_id = None
+        self._project_images = []
         self.sidebar.clear()
         self.canvas.clear()
-        self.label_list.clear()
+        self._suspend_label_persistence = True
+        try:
+            self.label_list.clear()
+        finally:
+            self._suspend_label_persistence = False
+        self.canvas.setLabelColors({})
         self.toolbar.setProjectLoaded(False)
         self.status_bar.clearProject()
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
@@ -486,11 +538,21 @@ class MainWindow(QMainWindow):
         dialog = ImportLabelsDialog(self, self.current_project_id)
         if dialog.exec():
             self.refreshImageGrid()
+            # Reflect imported annotations for the open image without
+            # clobbering unsaved edits.
+            if self.current_image_id and not self.annotations_dirty:
+                annotation = get_annotation(self.current_image_id)
+                shapes = annotation['data'].get('shapes', []) if annotation else []
+                self.canvas.loadShapes(shapes)
+                self._label_counts = {}
+                self.syncLabelsFromShapes()
+                self.annotations_dirty = False
     
     def refreshImageGrid(self):
         """Refresh the image grid."""
         if self.current_project_id:
             images = get_project_images(self.current_project_id)
+            self._project_images = images
             self.sidebar.setImages(images)
     
     # Image management
@@ -529,37 +591,221 @@ class MainWindow(QMainWindow):
             
             # Load existing annotation
             annotation = get_annotation(image_id)
-            if annotation:
-                self.canvas.loadShapes(annotation['data'].get('shapes', []))
+            shapes = annotation['data'].get('shapes', []) if annotation else []
+            self.canvas.loadShapes(shapes)
+            # Switching images is not a label edit: start the count baseline
+            # fresh so the new image never prunes labels from the old one.
+            self._label_counts = {}
+            self.syncLabelsFromShapes()
+            self.status_bar.setShapeCount(len(self.canvas.shapes))
             
             self.annotations_dirty = False
             self.imageSelected.emit(image_id)
             self.status_bar.setImage(image)
+            self._updateWindowTitle(image_id)
         else:
             QMessageBox.warning(self, "Error", "Failed to load image.")
+
+    def _imageIndex(self, image_id: int) -> Optional[tuple]:
+        """Return (index, total) for an image, or None when not found."""
+        for i, image in enumerate(self._project_images, start=1):
+            if image['id'] == image_id:
+                return (i, len(self._project_images))
+        return None
+
+    def _updateWindowTitle(self, image_id: Optional[int] = None):
+        """Refresh the title bar with the current image index, e.g. '2/98'."""
+        if not self.current_project_id:
+            self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
+            return
+        project = get_project(self.current_project_id)
+        name = project['name'] if project else ""
+        position = self._imageIndex(image_id) if image_id is not None else None
+        if position:
+            index, total = position
+            self.setWindowTitle(
+                f"{APP_NAME} v{APP_VERSION} - {name} - {index}/{total}"
+            )
+        else:
+            self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} - {name}")
     
     # Annotation handling
+    def syncLabelsFromShapes(self):
+        """Add any shape labels to the label list and refresh their counts."""
+        shapes = self.canvas.getShapesData() if self.canvas else []
+        previous_counts = dict(self._label_counts)
+        self.label_list.syncFromShapes(shapes)
+
+        counts: dict = {}
+        for shape in shapes:
+            label = shape.get('label') or ''
+            if label:
+                counts[label] = counts.get(label, 0) + 1
+        self._label_counts = counts
+
+        # A label whose last shape just disappeared is clutter: drop it, but
+        # only when no other image still uses it.
+        vacated = [
+            label
+            for label, before in previous_counts.items()
+            if before > 0 and counts.get(label, 0) == 0
+        ]
+        if vacated:
+            self._pruneVacatedLabels(vacated)
+
+        self.canvas.setLabelColors(self.label_list.getLabelColors())
+        self.canvas.applyLabelVisibilities(
+            {
+                label: bool(data.get('visible', True))
+                for label, data in self.label_list.labels.items()
+            }
+        )
+        self.status_bar.setShapeCount(len(shapes))
+
+    def _pruneVacatedLabels(self, labels: List[str]):
+        """Remove label categories that no shape in any image uses anymore."""
+        if not self.current_project_id:
+            return
+        for label in labels:
+            if label not in self.label_list.labels:
+                continue
+            if self.label_list.labelCount(label) > 0:
+                continue
+            if label_in_use(
+                self.current_project_id,
+                label,
+                exclude_image_id=self.current_image_id,
+            ):
+                continue
+            self.label_list.removeLabel(label)
+    
     def onShapeCreated(self, shape_data: dict):
         self.annotations_dirty = True
         self.toolbar.setSaveEnabled(True)
+        self.syncLabelsFromShapes()
     
     def onShapeModified(self, shape_data: dict):
         self.annotations_dirty = True
         self.toolbar.setSaveEnabled(True)
+        self.syncLabelsFromShapes()
     
     def onShapeDeleted(self, shape_index: int):
         self.annotations_dirty = True
         self.toolbar.setSaveEnabled(True)
+        self.syncLabelsFromShapes()
     
     def onCanvasSelectionChanged(self, selected_indices: List[int]):
-        self.sidebar.setSelectedIndices(selected_indices)
-        self.label_list.setSelectedIndices(selected_indices)
+        shapes = self.canvas.getShapesData() if self.canvas else []
+        selected_labels = [
+            shapes[i].get('label')
+            for i in selected_indices
+            if 0 <= i < len(shapes) and shapes[i].get('label')
+        ]
+        self.label_list.setSelectedLabels(selected_labels)
+        self.status_bar.setShapeCount(len(shapes))
+        self.toolbar.setDeleteEnabled(bool(selected_indices))
     
     def onLabelSelected(self, label: str):
         self.canvas.setSelectedLabel(label)
     
     def onLabelVisibilityChanged(self, label: str, visible: bool):
         self.canvas.setLabelVisibility(label, visible)
+
+    def onLabelColorChanged(self, label: str, color: str):
+        self.canvas.setLabelColors(self.label_list.getLabelColors())
+
+    def onCanvasMouseMoved(self, pos):
+        self.status_bar.setCoordinates(pos.x(), pos.y())
+
+    def onCanvasShapesChanged(self):
+        """Refresh the UI after a canvas-initiated shape edit."""
+        if self.current_image_id:
+            self._afterShapeHistoryChange()
+        else:
+            self.syncLabelsFromShapes()
+
+    def _saveProjectLabels(self):
+        """Persist the current label metadata for the active project."""
+        if self._suspend_label_persistence or not self.current_project_id:
+            return
+        save_project_labels(
+            self.current_project_id, self.label_list.getLabelState()
+        )
+
+    def onLabelRename(self, old_label: str):
+        """Rename a label category, optionally across the whole project."""
+        dialog = RenameLabelDialog(
+            self,
+            old_label=old_label,
+            existing_labels=self.label_list.getLabels(),
+            allow_scope=True,
+            has_current_image=bool(self.current_image_id),
+        )
+        if not dialog.exec():
+            return
+
+        new_label = dialog.newLabel()
+        if not new_label or new_label == old_label:
+            return
+
+        scope = dialog.scope()
+        target_exists = new_label in self.label_list.getLabels()
+        old_color = self.label_list.labelColor(old_label)
+
+        # Does another image still need the old category? Renaming only this
+        # image must not take the category (and its color) away from them.
+        old_used_elsewhere = bool(
+            self.current_project_id
+            and label_in_use(
+                self.current_project_id,
+                old_label,
+                exclude_image_id=self.current_image_id,
+            )
+        )
+
+        # Register the new label first so the shape refresh that follows reuses
+        # the intended color instead of a palette fallback.
+        if not target_exists:
+            self.label_list.addLabel(new_label, color=old_color)
+
+        if scope == "project" and self.current_project_id:
+            rename_label_in_project(
+                self.current_project_id, old_label, new_label
+            )
+            self.canvas.renameLabelCategory(old_label, new_label)
+            self.label_list.renameLabel(old_label, new_label)
+        else:
+            if self.current_image_id:
+                self.canvas.renameLabelCategory(old_label, new_label)
+            if not old_used_elsewhere:
+                self.label_list.renameLabel(old_label, new_label)
+
+        self._saveProjectLabels()
+        self.syncLabelsFromShapes()
+
+    def onLabelSelectShapes(self, label: str):
+        self.canvas.selectShapesByLabel(label)
+
+    def onLabelDeleteShapes(self, label: str):
+        if self.canvas.deleteShapesByLabel(label):
+            self.label_list.removeLabel(label)
+            self._afterShapeHistoryChange()
+
+    def onLabelRemove(self, label: str):
+        count = self.label_list.labelCount(label)
+        if count > 0:
+            reply = QMessageBox.question(
+                self, "Remove Label",
+                f"'{label}' is used by {count} shape(s).\n"
+                "Delete those shapes and remove the label?",
+                QMessageBox.Yes | QMessageBox.Cancel,
+            )
+            if reply != QMessageBox.Yes:
+                return
+            if not self.canvas.deleteShapesByLabel(label):
+                return
+        self.label_list.removeLabel(label)
+        self._afterShapeHistoryChange()
     
     def onZoomChanged(self, zoom: float):
         self.zoom_widget.setZoom(zoom)
@@ -583,18 +829,28 @@ class MainWindow(QMainWindow):
         }
         
         save_annotation(self.current_image_id, annotation_data)
+        update_image(self.current_image_id, has_annotation=1)
         self.annotations_dirty = False
         self.toolbar.setSaveEnabled(False)
-        self.sidebar.refreshImage(self.current_image_id)
+        self.syncLabelsFromShapes()
         self.status_bar.showMessage("Annotation saved", 2000)
     
+    def _afterShapeHistoryChange(self):
+        """Refresh UI state after an undo/redo or bulk label deletion."""
+        if not self.current_image_id:
+            return
+        self.annotations_dirty = True
+        self.toolbar.setSaveEnabled(True)
+        self.syncLabelsFromShapes()
+        self.status_bar.setShapeCount(len(self.canvas.shapes))
+
     def undo(self):
-        if self.canvas:
-            self.canvas.undo()
+        if self.canvas and self.canvas.undo():
+            self._afterShapeHistoryChange()
     
     def redo(self):
-        if self.canvas:
-            self.canvas.redo()
+        if self.canvas and self.canvas.redo():
+            self._afterShapeHistoryChange()
     
     def deleteSelected(self):
         if self.canvas:
@@ -662,6 +918,7 @@ class MainWindow(QMainWindow):
     def handleAutoAnnotateResult(self, job_id: str, result: dict):
         if 'annotations' in result and self.current_image_id:
             self.canvas.loadShapes(result['annotations'])
+            self.syncLabelsFromShapes()
             self.annotations_dirty = True
             self.toolbar.setSaveEnabled(True)
     

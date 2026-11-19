@@ -25,6 +25,7 @@ class AnnotationToolbar(QToolBar):
     saveRequested = Signal()
     undoRequested = Signal()
     redoRequested = Signal()
+    deleteRequested = Signal()
     welcomeRequested = Signal()
     
     def __init__(self, parent=None):
@@ -49,12 +50,12 @@ class AnnotationToolbar(QToolBar):
             ("bbox", "Bounding Box", "B", "square"),
             ("polygon", "Polygon", "P", "polygon"),
             ("keypoint", "Keypoint", "K", "map-pin"),
-            ("pan", "Pan", "H", "move"),
         ]
         
         for tool_id, label, shortcut, icon_name in tools:
             action = QAction(label, self)
-            action.setShortcut(QKeySequence(shortcut))
+            # The Tools menu owns the shortcut; duplicating it here makes Qt
+            # report an ambiguous shortcut overload and fires neither action.
             action.setCheckable(True)
             action.setToolTip(f"{label} ({shortcut})")
             action.setData(tool_id)
@@ -68,7 +69,6 @@ class AnnotationToolbar(QToolBar):
         
         # Import/Export actions
         import_images_action = QAction("Import Images", self)
-        import_images_action.setShortcut(QKeySequence("Ctrl+I"))
         import_images_action.setToolTip("Import Images (Ctrl+I)")
         import_images_action.triggered.connect(self.importImagesRequested)
         self.addAction(import_images_action)
@@ -81,7 +81,6 @@ class AnnotationToolbar(QToolBar):
         self.addSeparator()
         
         export_action = QAction("Export Dataset", self)
-        export_action.setShortcut(QKeySequence("Ctrl+E"))
         export_action.setToolTip("Export Dataset (Ctrl+E)")
         export_action.triggered.connect(self.exportRequested)
         self.addAction(export_action)
@@ -90,8 +89,7 @@ class AnnotationToolbar(QToolBar):
         
         # Auto-annotate
         auto_annotate_action = QAction("Auto Annotate", self)
-        auto_annotate_action.setShortcut(QKeySequence("Ctrl+A"))
-        auto_annotate_action.setToolTip("Auto Annotate (Ctrl+A)")
+        auto_annotate_action.setToolTip("Auto Annotate (Ctrl+Shift+A)")
         auto_annotate_action.triggered.connect(self.autoAnnotateRequested)
         self.addAction(auto_annotate_action)
         
@@ -107,20 +105,24 @@ class AnnotationToolbar(QToolBar):
         
         self.addSeparator()
         
-        # Undo/Redo
+        # Undo/Redo (menu actions own the keyboard shortcuts)
         self.undo_action = QAction("Undo", self)
-        self.undo_action.setShortcut(QKeySequence.Undo)
         self.undo_action.setToolTip("Undo (Ctrl+Z)")
         self.undo_action.setEnabled(False)
         self.undo_action.triggered.connect(self.undoRequested)
         self.addAction(self.undo_action)
         
         self.redo_action = QAction("Redo", self)
-        self.redo_action.setShortcut(QKeySequence.Redo)
         self.redo_action.setToolTip("Redo (Ctrl+Shift+Z)")
         self.redo_action.setEnabled(False)
         self.redo_action.triggered.connect(self.redoRequested)
         self.addAction(self.redo_action)
+
+        self.delete_action = QAction("Delete", self)
+        self.delete_action.setToolTip("Delete selected shapes (Del)")
+        self.delete_action.setEnabled(False)
+        self.delete_action.triggered.connect(self.deleteRequested)
+        self.addAction(self.delete_action)
         
         self.addSeparator()
         
@@ -163,12 +165,15 @@ class AnnotationToolbar(QToolBar):
         """Update UI for project loaded state."""
         self.project_loaded = loaded
         
-        # Enable/disable actions based on project state
+        # Enable/disable actions based on project state. Undo/redo stay under
+        # the canvas history signal so they cannot be wrongly re-enabled.
         for action in self.actions():
-            if action.data() in TOOL_NAMES or action in [
-                self.save_action, self.undo_action, self.redo_action
-            ]:
+            if action.data() in TOOL_NAMES or action is self.save_action:
                 action.setEnabled(loaded)
+        if not loaded:
+            self.undo_action.setEnabled(False)
+            self.redo_action.setEnabled(False)
+            self.delete_action.setEnabled(False)
     
     def setSaveEnabled(self, enabled: bool):
         """Enable/disable save action."""
@@ -188,6 +193,10 @@ class AnnotationToolbar(QToolBar):
         """Update undo/redo enabled state."""
         self.undo_action.setEnabled(can_undo and self.project_loaded)
         self.redo_action.setEnabled(can_redo and self.project_loaded)
+
+    def setDeleteEnabled(self, enabled: bool):
+        """Enable or disable the Delete action."""
+        self.delete_action.setEnabled(enabled and self.project_loaded)
     
     def setImageInfo(self, text: str):
         """Set current image info label."""

@@ -45,8 +45,8 @@ class AnnotationStatusBar(QStatusBar):
         self.zoom_label.setText(f"{int(zoom * 100)}%")
     
     def setCoordinates(self, x: float, y: float):
-        """Set mouse coordinates."""
-        self.coords_label.setText(f"x: {int(x)}, y: {int(y)}")
+        """Set mouse coordinates (image pixels, rounded like LabelMe)."""
+        self.coords_label.setText(f"x: {round(x)}, y: {round(y)}")
     
     def setShapeCount(self, count: int):
         """Set shape count."""

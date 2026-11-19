@@ -18,8 +18,10 @@ from PySide6.QtGui import (
     QPixmap, QImage, QPainter, QColor, QFont, QIcon, QCursor,
     QStandardItemModel, QStandardItem, QAction
 )
+from PySide6.QtWidgets import QStyle
 
-from annotation_engine.config import SUPPORTED_IMAGE_FORMATS, COLORS
+from annotation_engine.config import SUPPORTED_IMAGE_FORMATS, COLORS, ICONS_DIR
+from annotation_engine.core.database import get_project
 
 
 class ImageGridModel(QAbstractListModel):
@@ -29,7 +31,7 @@ class ImageGridModel(QAbstractListModel):
         super().__init__(parent)
         self.images = images or []
         self.thumbnails = {}  # Cache for thumbnails
-        self.thumbnail_size = QSize(200, 200)
+        self.thumbnail_size = QSize(180, 180)
     
     def rowCount(self, parent=QModelIndex()) -> int:
         return len(self.images)
@@ -44,17 +46,18 @@ class ImageGridModel(QAbstractListModel):
             return image['filename']
         
         elif role == Qt.DecorationRole:
-            # Return thumbnail
-            thumb = self.getThumbnail(image)
-            if thumb:
-                return QIcon(thumb)
-            return QIcon()
+            # Return the cached thumbnail pixmap directly (no QIcon wrapping).
+            return self.getThumbnail(image)
         
         elif role == Qt.ToolTipRole:
             return f"{image['filename']}\n{image.get('width', '?')}x{image.get('height', '?')}"
         
         elif role == Qt.UserRole:
             return image
+        
+        elif role == Qt.UserRole + 1:
+            # 1-based index number (position in the ordered image list).
+            return index.row() + 1
         
         elif role == Qt.CheckStateRole:
             return Qt.Checked if image.get('_selected', False) else Qt.Unchecked
@@ -129,11 +132,11 @@ class ImageThumbnailDelegate(QStyledItemDelegate):
         rect = option.rect
         
         # Background
-        if option.state & QStyleOptionViewItem.State_Selected:
+        if option.state & QStyle.StateFlag.State_Selected:
             painter.fillRect(rect, QColor(COLORS['primary_100']))
             painter.setPen(QColor(COLORS['primary_500']))
             painter.drawRect(rect.adjusted(0, 0, -1, -1))
-        elif option.state & QStyleOptionViewItem.State_MouseOver:
+        elif option.state & QStyle.StateFlag.State_MouseOver:
             painter.fillRect(rect, QColor(COLORS['gray_100']))
         
         # Thumbnail area
@@ -144,11 +147,13 @@ class ImageThumbnailDelegate(QStyledItemDelegate):
             self.thumb_size
         )
         
-        # Draw thumbnail
-        icon = index.data(Qt.DecorationRole)
-        if icon:
-            pixmap = icon.pixmap(QSize(self.thumb_size, self.thumb_size))
-            painter.drawPixmap(thumb_rect, pixmap)
+        # Draw thumbnail at its native (cached) size, centered, so painting
+        # never re-scales the pixmap — this is the main grid-scroll cost.
+        pixmap = index.data(Qt.DecorationRole)
+        if pixmap and not pixmap.isNull():
+            x = thumb_rect.x() + (thumb_rect.width() - pixmap.width()) // 2
+            y = thumb_rect.y() + (thumb_rect.height() - pixmap.height()) // 2
+            painter.drawPixmap(x, y, pixmap)
         else:
             # Placeholder
             painter.fillRect(thumb_rect, QColor(COLORS['gray_200']))
@@ -184,17 +189,103 @@ class ImageThumbnailDelegate(QStyledItemDelegate):
             painter.setPen(Qt.white)
             painter.drawText(badge_rect, Qt.AlignCenter, image['split'].upper())
         
-        # Annotation indicator
+        # Index badge (top-left, mirroring the split badge top-right)
+        number = index.data(Qt.UserRole + 1)
+        if number is not None:
+            index_badge = QRect(
+                rect.x() + self.padding,
+                rect.y() + self.padding,
+                28, 20
+            )
+            painter.fillRect(index_badge, QColor(COLORS['gray_600']))
+            painter.setPen(Qt.white)
+            painter.drawText(index_badge, Qt.AlignCenter, str(number))
+        
+        # Annotation indicator (bottom-right of the thumbnail)
         if image.get('has_annotation'):
             painter.setPen(QColor(COLORS['primary_500']))
             painter.setFont(QFont("Arial", 10, QFont.Bold))
             painter.drawText(
-                QRect(thumb_rect.x(), thumb_rect.y(), 20, 20),
+                QRect(thumb_rect.right() - 20, thumb_rect.bottom() - 20, 20, 20),
                 Qt.AlignCenter, "✓"
             )
     
     def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:
         return QSize(self.thumb_size + self.padding * 2, self.thumb_size + self.padding * 2 + 60)
+
+
+class ImageListDelegate(QStyledItemDelegate):
+    """Compact text-only delegate for the list view."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.row_height = 26
+        self.padding = 6
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex):
+        image = index.data(Qt.UserRole)
+        if not image:
+            return
+
+        rect = option.rect
+        if option.state & QStyle.StateFlag.State_Selected:
+            painter.fillRect(rect, QColor(COLORS['primary_100']))
+            painter.setPen(QColor(COLORS['primary_500']))
+            painter.drawRect(rect.adjusted(0, 0, -1, -1))
+        elif option.state & QStyle.StateFlag.State_MouseOver:
+            painter.fillRect(rect, QColor(COLORS['gray_100']))
+
+        number = index.data(Qt.UserRole + 1)
+        text = f"{number}. {image['filename']}"
+        painter.setPen(QColor(COLORS['gray_900']))
+        text_rect = QRect(
+            rect.x() + self.padding,
+            rect.y(),
+            rect.width() - self.padding * 2,
+            self.row_height,
+        )
+        painter.drawText(text_rect, Qt.AlignLeft | Qt.AlignVCenter, text)
+
+    def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:
+        return QSize(0, self.row_height)
+
+
+class ImageFilterProxyModel(QSortFilterProxyModel):
+    """Filter by filename, 1-based index number, and split."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._search = ""
+        self._split = "All"
+
+    def setSearch(self, text: str):
+        self._search = (text or "").strip().lower()
+        self.invalidateFilter()
+
+    def setSplit(self, split: str):
+        self._split = split or "All"
+        self.invalidateFilter()
+
+    def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
+        model = self.sourceModel()
+        index = model.index(source_row, 0, source_parent)
+        image = model.data(index, Qt.UserRole)
+        if not image:
+            return False
+
+        if self._split != "All" and image.get('split') != self._split.lower():
+            return False
+
+        if self._search:
+            filename = (image.get('filename') or "").lower()
+            if self._search in filename:
+                return True
+            # A numeric query matches the 1-based index number.
+            if self._search.isdigit() and self._search == str(source_row + 1):
+                return True
+            return False
+
+        return True
 
 
 class ImageGridWidget(QWidget):
@@ -227,13 +318,17 @@ class ImageGridWidget(QWidget):
         self.grid_btn.setCheckable(True)
         self.grid_btn.setChecked(True)
         self.grid_btn.setToolTip("Grid View")
-        self.grid_btn.setIcon(QIcon.fromTheme("view-grid"))
+        grid_icon = ICONS_DIR / "grid.svg"
+        if grid_icon.exists():
+            self.grid_btn.setIcon(QIcon(str(grid_icon)))
         self.grid_btn.clicked.connect(lambda: self.setViewMode("grid"))
         
         self.list_btn = QPushButton()
         self.list_btn.setCheckable(True)
         self.list_btn.setToolTip("List View")
-        self.list_btn.setIcon(QIcon.fromTheme("view-list"))
+        list_icon = ICONS_DIR / "list.svg"
+        if list_icon.exists():
+            self.list_btn.setIcon(QIcon(str(list_icon)))
         self.list_btn.clicked.connect(lambda: self.setViewMode("list"))
         
         header_layout.addWidget(QLabel("Images"))
@@ -247,7 +342,7 @@ class ImageGridWidget(QWidget):
         filter_layout = QHBoxLayout()
         
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Search images...")
+        self.search_input.setPlaceholderText("Search by name or index...")
         self.search_input.textChanged.connect(self.filterImages)
         filter_layout.addWidget(self.search_input)
         
@@ -266,13 +361,19 @@ class ImageGridWidget(QWidget):
         self.list_view.setSpacing(8)
         self.list_view.setUniformItemSizes(True)
         self.list_view.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.list_view.setItemDelegate(ImageThumbnailDelegate())
+        self.list_view.setLayoutMode(QListView.Batched)
+        # ScrollPerPixel keeps a stable pixel-based wheel step after the
+        # grid <-> list delegate swap. ScrollPerItem collapses singleStep to 1
+        # when uniformItemSizes is re-applied, making wheel scrolling crawl.
+        self.list_view.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.grid_delegate = ImageThumbnailDelegate()
+        self.list_delegate = ImageListDelegate()
+        self.list_view.setItemDelegate(self.grid_delegate)
         
         # Model
         self.model = ImageGridModel()
-        self.proxy_model = QSortFilterProxyModel()
+        self.proxy_model = ImageFilterProxyModel()
         self.proxy_model.setSourceModel(self.model)
-        self.proxy_model.setFilterCaseSensitivity(Qt.CaseInsensitive)
         self.list_view.setModel(self.proxy_model)
         
         # Connect signals
@@ -302,31 +403,21 @@ class ImageGridWidget(QWidget):
             self.list_view.setViewMode(QListView.IconMode)
             self.list_view.setFlow(QListView.LeftToRight)
             self.list_view.setWrapping(True)
+            self.list_view.setSpacing(8)
+            self.list_view.setUniformItemSizes(True)
+            self.list_view.setItemDelegate(self.grid_delegate)
         else:
             self.list_view.setViewMode(QListView.ListMode)
             self.list_view.setFlow(QListView.TopToBottom)
             self.list_view.setWrapping(False)
-    
+            self.list_view.setSpacing(2)
+            self.list_view.setUniformItemSizes(True)
+            self.list_view.setItemDelegate(self.list_delegate)
+
     def filterImages(self):
-        """Filter images by search text and split."""
-        search_text = self.search_input.text().lower()
-        split_filter = self.split_filter.currentText()
-        
-        def filter_func(index):
-            image = index.data(Qt.UserRole)
-            if not image:
-                return False
-            
-            if search_text and search_text not in image['filename'].lower():
-                return False
-            
-            if split_filter != "All" and image.get('split') != split_filter.lower():
-                return False
-            
-            return True
-        
-        self.proxy_model.setFilterFixedString(search_text)
-        # Custom filtering would need a custom proxy model
+        """Filter images by search text (name or index) and split."""
+        self.proxy_model.setSearch(self.search_input.text())
+        self.proxy_model.setSplit(self.split_filter.currentText())
     
     def onItemClicked(self, index: QModelIndex):
         """Handle single click."""
