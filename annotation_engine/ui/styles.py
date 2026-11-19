@@ -28,6 +28,7 @@ def get_application_stylesheet(dark_mode: bool = False) -> str:
         border_focus = "#3b82f6"
     
     primary = "#3b82f6"
+    primary_rgb = "59, 130, 246"  # the same color, for rgba() tints
     primary_hover = "#2563eb"
     primary_pressed = "#1d4ed8"
     success = "#22c55e"
@@ -89,10 +90,27 @@ QPushButton[flat="true"]:hover {{ background-color: {bg_tertiary}; border-radius
 QToolBar {{
     background-color: {bg_secondary};
     border-bottom: 1px solid {border_color};
-    padding: 8px;
-    spacing: 8px;
+    padding: 6px;
+    spacing: 4px;
 }}
 QToolBar::separator {{ background: {border_color}; width: 1px; margin: 4px 8px; }}
+
+/* Tool buttons are icon-only, so give them a hit area and a visible
+   checked state for the exclusive drawing tools. */
+QToolBar QToolButton {{
+    padding: 4px;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: transparent;
+}}
+QToolBar QToolButton:hover {{ background-color: {bg_tertiary}; }}
+QToolBar QToolButton:pressed {{ background-color: {bg_tertiary}; }}
+QToolBar QToolButton:checked {{
+    background-color: rgba({primary_rgb}, 0.16);
+    border-color: rgba({primary_rgb}, 0.45);
+}}
+QToolBar QToolButton:checked:hover {{ background-color: rgba({primary_rgb}, 0.24); }}
+QToolBar QToolButton:disabled {{ background: transparent; }}
 
 QMenuBar {{
     background-color: {bg_secondary};

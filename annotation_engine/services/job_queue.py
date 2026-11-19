@@ -5,7 +5,7 @@ import uuid
 from typing import Callable, Dict, Any, Optional
 from dataclasses import dataclass
 
-from PySide6.QtCore import QObject, QThread, Signal, Slot
+from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 from PySide6.QtWidgets import QApplication
 
 
@@ -91,9 +91,12 @@ class JobQueue(QObject):
         
         self.jobs[job_id] = job
         
-        # Start if not running
+        # Defer the start by one event-loop turn so a caller can connect its
+        # result handlers after `enqueue` returns. Starting synchronously would
+        # let a fast job finish before those connections exist.
         if not self.running:
-            self._process_queue()
+            self.running = True
+            QTimer.singleShot(0, self._process_queue)
         
         return job_id
     
@@ -126,13 +129,21 @@ class JobQueue(QObject):
         worker.progress.connect(lambda p, m: self.jobProgress.emit(job.id, p, m))
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
+        # The thread reference must outlive the run: dropping it here would
+        # let Python collect a QThread that is still executing.
+        thread.finished.connect(lambda: self._forget_thread(job.id))
         
         self.workers[job.id] = worker
         self.threads[job.id] = thread
         
         thread.start()
         self.jobStarted.emit(job.id)
+    
+    def _forget_thread(self, job_id: str):
+        """Drop a thread once Qt reports it has actually stopped."""
+        thread = self.threads.pop(job_id, None)
+        if thread is not None:
+            thread.deleteLater()
     
     def _on_job_finished(self, job_id: str, result: dict):
         """Handle job completion."""
@@ -147,11 +158,9 @@ class JobQueue(QObject):
         self._process_queue()
     
     def _cleanup_job(self, job_id: str):
-        """Clean up job resources."""
+        """Release the job and worker, keeping the thread until it stops."""
         if job_id in self.workers:
             del self.workers[job_id]
-        if job_id in self.threads:
-            del self.threads[job_id]
         if job_id in self.jobs:
             del self.jobs[job_id]
     

@@ -13,6 +13,7 @@ from annotation_engine.core.database import (
     get_database, get_project, get_project_images, get_annotation
 )
 from annotation_engine.config import EXPORT_FORMATS
+from annotation_engine.utils.file_ops import build_labelme_payload, write_labelme_json
 
 
 class ExportService:
@@ -194,175 +195,69 @@ class ExportService:
             print(f"YOLO export error: {e}")
             return False
     
-    def export_coco(
+    def export_labelme(
         self,
-        output_path: Path,
-        include_bboxes: bool = True,
-        include_polygons: bool = True,
-        include_keypoints: bool = True,
+        output_dir: Path,
+        copy_images: bool = True,
         progress_callback: Optional[callable] = None
     ) -> bool:
-        """
-        Export annotations in COCO format.
+        """Export annotations as standard LabelMe JSON files.
+
+        The layout mirrors a LabelMe folder so the result opens directly in
+        LabelMe::
+
+            <output_dir>/labels/<stem>.json
+            <output_dir>/images/<name>        (when copy_images is on)
+
+        Every shape is written verbatim, so circles, LineStrips, masks and
+        other non-rectangle kinds survive the round trip.
         """
         try:
-            output_path = Path(output_path)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            # Build COCO structure
-            coco = {
-                'info': {
-                    'description': f'{self.project["name"]} Dataset',
-                    'version': '1.0',
-                    'year': 2024
-                },
-                'licenses': [],
-                'images': [],
-                'annotations': [],
-                'categories': []
-            }
-            
-            # Build category mapping
-            categories = self._get_category_mapping(True, True)
-            for name, cat_id in sorted(categories.items(), key=lambda x: x[1]):
-                coco['categories'].append({
-                    'id': cat_id + 1,  # COCO uses 1-based indexing
-                    'name': name,
-                    'supercategory': 'object'
-                })
-            
-            cat_name_to_coco_id = {name: cat_id + 1 for name, cat_id in categories.items()}
-            
-            # Process images
-            annotation_id = 1
+            output_dir = Path(output_dir)
+            labels_dir = output_dir / 'labels'
+            images_dir = output_dir / 'images'
+            labels_dir.mkdir(parents=True, exist_ok=True)
+            if copy_images:
+                images_dir.mkdir(parents=True, exist_ok=True)
+
             total = len(self.images)
-            
             for i, image in enumerate(self.images):
                 if progress_callback:
                     progress_callback(
                         int((i / total) * 100),
-                        f"Processing {image['filename']}"
+                        f"Exporting {image['filename']}"
                     )
-                
-                # Add image info
-                coco_image = {
-                    'id': image['id'],
-                    'file_name': image['filename'],
-                    'width': image['width'] or 0,
-                    'height': image['height'] or 0
-                }
-                coco['images'].append(coco_image)
-                
-                # Get annotation
+
+                if copy_images:
+                    src = self.base_path / image['relative_path']
+                    dst = images_dir / image['filename']
+                    if src.exists():
+                        shutil.copy2(src, dst)
+
                 annotation = get_annotation(image['id'])
-                if not annotation:
-                    continue
-                
-                img_width = image['width'] or 1
-                img_height = image['height'] or 1
-                
-                for shape in annotation['data'].get('shapes', []):
-                    label = shape.get('label', 'unknown')
-                    shape_type = shape.get('shape_type', 'polygon')
-                    points = shape.get('points', [])
-                    
-                    if label not in cat_name_to_coco_id:
-                        continue
-                    
-                    cat_id = cat_name_to_coco_id[label]
-                    
-                    if shape_type == 'rectangle' and len(points) >= 2:
-                        if not include_bboxes:
-                            continue
-                        
-                        x1, y1 = points[0]
-                        x2, y2 = points[1]
-                        x = min(x1, x2)
-                        y = min(y1, y2)
-                        w = abs(x2 - x1)
-                        h = abs(y2 - y1)
-                        
-                        coco['annotations'].append({
-                            'id': annotation_id,
-                            'image_id': image['id'],
-                            'category_id': cat_id,
-                            'bbox': [x, y, w, h],
-                            'area': w * h,
-                            'iscrowd': 0,
-                            'segmentation': []
-                        })
-                        annotation_id += 1
-                    
-                    elif shape_type == 'polygon' and len(points) >= 3:
-                        if not include_polygons:
-                            continue
-                        
-                        # Flatten points for COCO segmentation
-                        segmentation = []
-                        for x, y in points:
-                            segmentation.append(x)
-                            segmentation.append(y)
-                        
-                        # Calculate bbox from polygon
-                        xs = [p[0] for p in points]
-                        ys = [p[1] for p in points]
-                        x, y = min(xs), min(ys)
-                        w, h = max(xs) - x, max(ys) - y
-                        
-                        # Calculate area using shoelace formula
-                        area = 0
-                        for j in range(len(points)):
-                            x1, y1 = points[j]
-                            x2, y2 = points[(j + 1) % len(points)]
-                            area += x1 * y2 - x2 * y1
-                        area = abs(area) / 2
-                        
-                        coco['annotations'].append({
-                            'id': annotation_id,
-                            'image_id': image['id'],
-                            'category_id': cat_id,
-                            'bbox': [x, y, w, h],
-                            'area': area,
-                            'iscrowd': 0,
-                            'segmentation': [segmentation]
-                        })
-                        annotation_id += 1
-                    
-                    elif shape_type == 'point' and len(points) >= 1:
-                        if not include_keypoints:
-                            continue
-                        
-                        x, y = points[0]
-                        
-                        # COCO keypoint format: [x, y, visibility]
-                        # visibility: 0=not labeled, 1=labeled but not visible, 2=visible
-                        keypoints = [x, y, 2]
-                        
-                        coco['annotations'].append({
-                            'id': annotation_id,
-                            'image_id': image['id'],
-                            'category_id': cat_id,
-                            'bbox': [x - 1, y - 1, 2, 2],  # Small bbox around point
-                            'area': 4,
-                            'iscrowd': 0,
-                            'keypoints': keypoints,
-                            'num_keypoints': 1
-                        })
-                        annotation_id += 1
-            
-            # Write COCO JSON
-            with open(output_path, 'w') as f:
-                json.dump(coco, f, indent=2)
-            
+                shapes = annotation['data'].get('shapes', []) if annotation else []
+
+                relative = (image.get('relative_path') or image['filename']).replace('\\', '/')
+                payload = build_labelme_payload(
+                    shapes=shapes,
+                    image_path=f"../{relative}" if copy_images else relative,
+                    image_width=image['width'] or 0,
+                    image_height=image['height'] or 0,
+                )
+                write_labelme_json(
+                    payload,
+                    labels_dir / f"{Path(image['filename']).stem}.json"
+                )
+
             if progress_callback:
-                progress_callback(100, f"Exported {total} images to COCO format")
-            
+                progress_callback(100, f"Exported {total} images to LabelMe format")
+
             return True
-            
+
         except Exception as e:
-            print(f"COCO export error: {e}")
+            print(f"LabelMe export error: {e}")
             return False
-    
+
     def export_both(
         self,
         output_dir: Path,
@@ -372,13 +267,13 @@ class ExportService:
         include_keypoints: bool = True,
         progress_callback: Optional[callable] = None
     ) -> bool:
-        """Export both YOLO and COCO formats."""
+        """Export both YOLO and LabelMe formats."""
         try:
             output_dir = Path(output_dir)
             output_dir.mkdir(parents=True, exist_ok=True)
             
             yolo_dir = output_dir / 'yolo'
-            coco_path = output_dir / 'coco.json'
+            labelme_dir = output_dir / 'labelme'
             
             if progress_callback:
                 progress_callback(0, "Exporting YOLO format...")
@@ -393,21 +288,20 @@ class ExportService:
             )
             
             if progress_callback:
-                progress_callback(50, "Exporting COCO format...")
+                progress_callback(50, "Exporting LabelMe format...")
             
-            def coco_progress(p, msg):
+            def labelme_progress(p, msg):
                 if progress_callback:
-                    progress_callback(50 + p // 2, f"COCO: {msg}")
+                    progress_callback(50 + p // 2, f"LabelMe: {msg}")
             
-            coco_success = self.export_coco(
-                coco_path, include_bboxes, include_polygons, include_keypoints,
-                coco_progress
+            labelme_success = self.export_labelme(
+                labelme_dir, copy_images=True, progress_callback=labelme_progress
             )
             
             if progress_callback:
                 progress_callback(100, "Export complete")
             
-            return yolo_success and coco_success
+            return yolo_success and labelme_success
             
         except Exception as e:
             print(f"Export both error: {e}")

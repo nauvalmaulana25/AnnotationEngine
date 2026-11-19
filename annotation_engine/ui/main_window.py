@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
     QStatusBar, QMenuBar, QMenu, QFileDialog, QMessageBox,
     QVBoxLayout, QLabel, QProgressBar, QDialog, QScrollArea, QFrame
 )
-from PySide6.QtCore import Qt, QSettings, QSize, Signal, Slot, QThread
+from PySide6.QtCore import Qt, QSettings, QSize, Signal, Slot, QThread, QTimer
 from PySide6.QtGui import QAction, QIcon, QKeySequence
 
 from annotation_engine.config import (
@@ -23,7 +23,7 @@ from annotation_engine.core.database import (
     update_image, save_annotation, get_annotation, get_setting, set_setting,
     add_recent_project, get_recent_projects, clean_database,
     get_project_labels, save_project_labels, rename_label_in_project,
-    label_in_use
+    label_in_use, get_project_annotations
 )
 from annotation_engine.ui.styles import get_application_stylesheet
 from annotation_engine.ui.widgets.image_grid import ImageGridWidget
@@ -43,7 +43,14 @@ from annotation_engine.ui.dialogs.rename_label import RenameLabelDialog
 from annotation_engine.ui.canvas import AnnotationCanvas
 from annotation_engine.ui.welcome_window import WelcomeWindow
 from annotation_engine.utils.encryption import EncryptionManager
+from annotation_engine.utils.file_ops import build_labelme_payload, write_labelme_json
 from annotation_engine.services.job_queue import JobQueue
+from annotation_engine.services.mobile_sam import MobileSAMService
+from annotation_engine.services.model_manager import (
+    ModelDownloadError,
+    download_mobile_sam,
+    mobile_sam_path,
+)
 
 # Project root for resources
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -71,6 +78,19 @@ class MainWindow(QMainWindow):
         self._suspend_label_persistence: bool = False
         self._label_counts: dict = {}
         self._project_images: List[dict] = []
+        self._suspend_autosave: bool = False
+        self._mobile_sam: Optional[MobileSAMService] = None
+        self._mobile_sam_job: Optional[str] = None
+        self._auto_annotate_dialog: Optional[AutoAnnotateDialog] = None
+        self._managed_jobs: dict = {}
+        
+        # Autosave: every edit (including undo/redo) persists shortly after it
+        # settles. A single-shot timer coalesces bursts, e.g. a delete that
+        # rebuilds the label list, into one write.
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setSingleShot(True)
+        self._autosave_timer.setInterval(400)
+        self._autosave_timer.timeout.connect(self._flushAutosave)
         
         # Services
         self.encryption = EncryptionManager()
@@ -180,7 +200,6 @@ class MainWindow(QMainWindow):
         self.toolbar.importLabelsRequested.connect(self.importLabels)
         self.toolbar.exportRequested.connect(self.exportDataset)
         self.toolbar.autoAnnotateRequested.connect(self.showAutoAnnotate)
-        self.toolbar.saveRequested.connect(self.saveAnnotation)
         self.toolbar.undoRequested.connect(self.undo)
         self.toolbar.redoRequested.connect(self.redo)
         self.toolbar.deleteRequested.connect(self.deleteSelected)
@@ -258,6 +277,14 @@ class MainWindow(QMainWindow):
         export_action.setShortcut(QKeySequence("Ctrl+E"))
         export_action.triggered.connect(self.exportDataset)
         file_menu.addAction(export_action)
+        
+        # Manual save. Edits autosave, so this is a safety net rather than the
+        # normal way to persist work.
+        save_action = QAction("&Save Annotation", self)
+        save_action.setShortcut(QKeySequence.Save)
+        save_action.setStatusTip("Save the current annotation now (Ctrl+S)")
+        save_action.triggered.connect(lambda: self.saveAnnotation(silent=False))
+        file_menu.addAction(save_action)
         
         file_menu.addSeparator()
         
@@ -387,6 +414,7 @@ class MainWindow(QMainWindow):
     
     def returnToWelcome(self):
         """Prompt to save if dirty, then show welcome dialog."""
+        self._flushAutosave()
         if self.annotations_dirty:
             reply = QMessageBox.question(
                 self, "Unsaved Changes",
@@ -476,6 +504,7 @@ class MainWindow(QMainWindow):
             self._suspend_label_persistence = False
         self.canvas.setLabelColors(self.label_list.getLabelColors())
         self._label_counts = {}
+        self._syncGridAnnotations()
         
         # Clear canvas
         self.canvas.clear()
@@ -491,6 +520,7 @@ class MainWindow(QMainWindow):
     
     def closeProject(self):
         """Close current project."""
+        self._flushAutosave()
         if self.annotations_dirty:
             reply = QMessageBox.question(
                 self, "Unsaved Changes",
@@ -554,6 +584,39 @@ class MainWindow(QMainWindow):
             images = get_project_images(self.current_project_id)
             self._project_images = images
             self.sidebar.setImages(images)
+            self._syncGridAnnotations()
+
+    def _gridLabelMeta(self):
+        """Return (colors, visibility) maps for the current label list."""
+        colors = self.label_list.getLabelColors()
+        visibility = {
+            label: bool(data.get('visible', True))
+            for label, data in self.label_list.labels.items()
+        }
+        return colors, visibility
+
+    def _pushGridLabelMeta(self):
+        """Push label colors/visibility into the grid (no annotation refetch)."""
+        if not self.current_project_id:
+            return
+        colors, visibility = self._gridLabelMeta()
+        self.sidebar.setAnnotationData(
+            annotations=None,
+            label_colors=colors,
+            label_visibility=visibility,
+        )
+
+    def _syncGridAnnotations(self):
+        """Reload saved annotations and label metadata into the grid overlays."""
+        if not self.current_project_id:
+            return
+        annotations = get_project_annotations(self.current_project_id)
+        colors, visibility = self._gridLabelMeta()
+        self.sidebar.setAnnotationData(
+            annotations=annotations,
+            label_colors=colors,
+            label_visibility=visibility,
+        )
     
     # Image management
     def onImageSelected(self, image_id: int):
@@ -573,9 +636,11 @@ class MainWindow(QMainWindow):
         if self.current_image_id == image_id:
             return
         
-        # Save current annotations if dirty
+        # Persist pending edits before the canvas switches images; otherwise a
+        # queued autosave would write the old shapes into the new image.
         if self.annotations_dirty and self.current_image_id:
-            self.saveAnnotation()
+            self._autosave_timer.stop()
+            self.saveAnnotation(silent=True)
         
         image = get_image(image_id)
         if not image:
@@ -661,6 +726,7 @@ class MainWindow(QMainWindow):
             }
         )
         self.status_bar.setShapeCount(len(shapes))
+        self._pushGridLabelMeta()
 
     def _pruneVacatedLabels(self, labels: List[str]):
         """Remove label categories that no shape in any image uses anymore."""
@@ -680,18 +746,15 @@ class MainWindow(QMainWindow):
             self.label_list.removeLabel(label)
     
     def onShapeCreated(self, shape_data: dict):
-        self.annotations_dirty = True
-        self.toolbar.setSaveEnabled(True)
+        self._markDirty()
         self.syncLabelsFromShapes()
     
     def onShapeModified(self, shape_data: dict):
-        self.annotations_dirty = True
-        self.toolbar.setSaveEnabled(True)
+        self._markDirty()
         self.syncLabelsFromShapes()
     
     def onShapeDeleted(self, shape_index: int):
-        self.annotations_dirty = True
-        self.toolbar.setSaveEnabled(True)
+        self._markDirty()
         self.syncLabelsFromShapes()
     
     def onCanvasSelectionChanged(self, selected_indices: List[int]):
@@ -710,9 +773,11 @@ class MainWindow(QMainWindow):
     
     def onLabelVisibilityChanged(self, label: str, visible: bool):
         self.canvas.setLabelVisibility(label, visible)
+        self._pushGridLabelMeta()
 
     def onLabelColorChanged(self, label: str, color: str):
         self.canvas.setLabelColors(self.label_list.getLabelColors())
+        self._pushGridLabelMeta()
 
     def onCanvasMouseMoved(self, pos):
         self.status_bar.setCoordinates(pos.x(), pos.y())
@@ -811,36 +876,81 @@ class MainWindow(QMainWindow):
         self.zoom_widget.setZoom(zoom)
         self.status_bar.setZoom(zoom)
     
-    def saveAnnotation(self):
+    def saveAnnotation(self, silent: bool = True):
+        """Persist the current image's shapes to the database and label file.
+
+        Autosave calls this with ``silent`` so routine edits do not flash a
+        status message on every change.
+        """
         if not self.current_image_id or not self.current_project_id:
             return
         
         shapes = self.canvas.getShapesData()
         image = get_image(self.current_image_id)
+        if not image:
+            return
         
-        annotation_data = {
-            "version": "5.4.1",
-            "flags": {},
-            "shapes": shapes,
-            "imagePath": image['filename'],
-            "imageData": None,
-            "imageHeight": image['height'] or 0,
-            "imageWidth": image['width'] or 0
-        }
+        annotation_data = build_labelme_payload(
+            shapes=shapes,
+            image_path=self._labelImagePath(image),
+            image_width=image['width'] or 0,
+            image_height=image['height'] or 0,
+        )
         
         save_annotation(self.current_image_id, annotation_data)
         update_image(self.current_image_id, has_annotation=1)
+        self._writeLabelFile(image, annotation_data)
         self.annotations_dirty = False
-        self.toolbar.setSaveEnabled(False)
         self.syncLabelsFromShapes()
-        self.status_bar.showMessage("Annotation saved", 2000)
+        self._syncGridAnnotations()
+        if not silent:
+            self.status_bar.showMessage("Annotation saved", 2000)
+    
+    def _labelImagePath(self, image: dict) -> str:
+        """Return the image path LabelMe should store in the label file.
+
+        LabelMe resolves ``imagePath`` relative to the label file, and label
+        files live in ``<project>/labels``, so the sibling images directory is
+        reached with ``../images/<name>``.
+        """
+        relative = (image.get('relative_path') or image.get('filename') or '').replace('\\', '/')
+        return f"../{relative}" if relative else (image.get('filename') or '')
+    
+    def _labelFilePath(self, image: dict) -> Optional[Path]:
+        """Return ``<project>/labels/<image stem>.json`` for an image."""
+        project = get_project(self.current_project_id)
+        if not project:
+            return None
+        filename = image.get('filename') or ''
+        if not filename:
+            return None
+        return Path(project['base_path']) / 'labels' / f"{Path(filename).stem}.json"
+    
+    def _writeLabelFile(self, image: dict, payload: dict):
+        """Mirror the annotation to a standard LabelMe JSON file."""
+        label_path = self._labelFilePath(image)
+        if label_path is not None:
+            write_labelme_json(payload, label_path)
+    
+    def _markDirty(self):
+        """Flag the annotation as changed and schedule an autosave."""
+        if not self.current_image_id:
+            return
+        self.annotations_dirty = True
+        if not self._suspend_autosave:
+            self._autosave_timer.start()
+    
+    def _flushAutosave(self):
+        """Persist pending edits now, if any."""
+        self._autosave_timer.stop()
+        if self.annotations_dirty:
+            self.saveAnnotation(silent=True)
     
     def _afterShapeHistoryChange(self):
         """Refresh UI state after an undo/redo or bulk label deletion."""
         if not self.current_image_id:
             return
-        self.annotations_dirty = True
-        self.toolbar.setSaveEnabled(True)
+        self._markDirty()
         self.syncLabelsFromShapes()
         self.status_bar.setShapeCount(len(self.canvas.shapes))
 
@@ -887,22 +997,402 @@ class MainWindow(QMainWindow):
             images = get_project_images(self.current_project_id)
             selected_images = [img['id'] for img in images]
         
-        dialog = AutoAnnotateDialog(self, self.current_project_id, selected_images)
-        dialog.exec()
+        dialog = AutoAnnotateDialog(
+            self,
+            self.current_project_id,
+            selected_images,
+            labels=self._autoAnnotateLabels(),
+            annotated_count=len(
+                get_project_annotations(self.current_project_id)
+            ),
+        )
+        dialog.runMobileSAM.connect(self.runMobileSam)
+        dialog.downloadMobileSAM.connect(self.downloadMobileSamModel)
+        self._auto_annotate_dialog = dialog
+        try:
+            dialog.exec()
+        finally:
+            self._auto_annotate_dialog = None
+
+    def _autoAnnotateLabels(self) -> List[str]:
+        """Labels offered to the auto-annotate dialogs, in sidebar order."""
+        labels = list(self.label_list.getLabels()) if self.label_list else []
+        if labels or not self.current_project_id:
+            return labels
+        return [row['name'] for row in get_project_labels(self.current_project_id)]
+
+    # ------------------------------------------------------------------
+    # MobileSAM
+    # ------------------------------------------------------------------
+    def mobileSamService(self, device: str = None) -> MobileSAMService:
+        """Return the shared MobileSAM service, creating it on first use.
+
+        A changed device preference replaces the service, since the device is
+        resolved once at construction.
+        """
+        from annotation_engine.services.device import DEVICE_AUTO
+
+        wanted = device or DEVICE_AUTO
+        if (
+            self._mobile_sam is None
+            or getattr(self._mobile_sam, "device_preference", None) != wanted
+        ):
+            if self._mobile_sam is not None:
+                self._mobile_sam.unload()
+            self._mobile_sam = MobileSAMService(device=wanted)
+        return self._mobile_sam
+
+    def downloadMobileSamModel(self):
+        """Download the MobileSAM checkpoint into the models directory."""
+        dialog = self._auto_annotate_dialog
+
+        def worker(progress_callback=None):
+            return str(download_mobile_sam(progress_callback=progress_callback))
+
+        def on_done(path: str):
+            if dialog is not None:
+                dialog.refreshModelStatus()
+                dialog.setProgress(100, "MobileSAM model ready")
+            self.status_bar.showMessage(f"MobileSAM model saved to {path}", 5000)
+
+        def on_error(message: str):
+            if dialog is not None:
+                dialog.setProgress(0, "Download failed")
+            QMessageBox.critical(
+                self, "Download Failed",
+                f"Could not download the MobileSAM model:\n{message}"
+            )
+
+        self._runBackgroundJob(
+            'mobile_sam_download', worker, on_done, on_error,
+            title="Downloading MobileSAM",
+        )
+
+    def runMobileSam(self, options: dict):
+        """Segment boxes with MobileSAM, in the background."""
+        if not self.current_project_id:
+            return
+
+        label = options.get('label')
+        source = options.get('source') or 'existing'
+        device = options.get('device') or 'auto'
+        remove_boxes = bool(options.get('remove_boxes'))
+
+        if source == 'existing':
+            if not self.current_image_id:
+                QMessageBox.warning(
+                    self, "No Image", "Open an image before running MobileSAM."
+                )
+                return
+            image_ids = [self.current_image_id]
+        else:
+            # "All annotated images" means exactly that. The dialog's selection
+            # holds whatever the user clicked to open an image, so it cannot be
+            # used to decide the scope.
+            image_ids = list(
+                get_project_annotations(self.current_project_id).keys()
+            )
+
+        # Persist in-flight edits first: the boxes are read from saved data.
+        self._flushAutosave()
+
+        tasks = []
+        skipped = 0
+        for image_id in image_ids:
+            image = get_image(image_id)
+            if not image:
+                continue
+            project = get_project(self.current_project_id)
+            if not project:
+                return
+            image_path = os.path.join(project['base_path'], image['relative_path'])
+
+            annotation = get_annotation(image_id)
+            shapes = annotation['data'].get('shapes', []) if annotation else []
+            matched = [
+                (index, shape) for index, shape in enumerate(shapes)
+                if self._boxMatchesLabel(shape, label)
+            ]
+            prompts = []
+            for _, shape in matched:
+                box = self._shapeBox(shape)
+                if box is not None:
+                    prompts.append({
+                        'box': box,
+                        'label': shape.get('label') or 'object',
+                        'removable': (shape.get('shape_type') or '') == 'rectangle',
+                        'shape': shape,
+                    })
+            if not prompts:
+                skipped += 1
+                continue
+            tasks.append({
+                'image_id': image_id,
+                'image_path': image_path,
+                'prompts': prompts,
+                'shapes': shapes,
+            })
+
+        if not tasks:
+            QMessageBox.information(
+                self, "MobileSAM",
+                "No boxes matched. Draw bounding boxes first, or pick "
+                "another label."
+            )
+            return
+
+        min_score = float(options.get('iou_threshold') or 0.0)
+        fallback_label = None if label in (None, '', '__all__') else label
+
+        def worker(progress_callback=None):
+            service = self.mobileSamService(device)
+            results = {}
+            total = len(tasks)
+            for index, task in enumerate(tasks):
+                def report(percent, message, _i=index):
+                    overall = int(((_i + percent / 100) / total) * 100)
+                    progress_callback(overall, message)
+
+                # Each mask keeps the label of the box that prompted it, so an
+                # all-labels run still produces per-class shapes.
+                results[task['image_id']] = service.segment_labeled(
+                    task['image_path'],
+                    [prompt['box'] for prompt in task['prompts']],
+                    [prompt['label'] for prompt in task['prompts']],
+                    report,
+                    min_score=min_score,
+                )
+            return {
+                'results': results,
+                'label': fallback_label,
+                'tasks': tasks,
+                'device': service.device_description,
+            }
+
+        def on_done(result: dict):
+            self._applyMobileSamResult(result, remove_boxes=remove_boxes)
+            if skipped:
+                self.status_bar.showMessage(
+                    f"MobileSAM finished; {skipped} image(s) had no matching boxes",
+                    4000,
+                )
+
+        def on_error(message: str):
+            QMessageBox.critical(
+                self, "MobileSAM Failed", f"Segmentation failed:\n{message}"
+            )
+
+        self._mobile_sam_job = self._runBackgroundJob(
+            'mobile_sam', worker, on_done, on_error,
+            title="Running MobileSAM",
+        )
+
+    @staticmethod
+    def _shapeBox(shape: dict) -> Optional[List[float]]:
+        """Return a shape's bounding box as ``[x1, y1, x2, y2]``."""
+        points = shape.get('points') or []
+        if not points:
+            return None
+        xs = [p[0] for p in points if len(p) >= 2]
+        ys = [p[1] for p in points if len(p) >= 2]
+        if not xs or not ys:
+            return None
+        return [float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys))]
+
+    @staticmethod
+    def _boxMatchesLabel(shape: dict, label: Optional[str]) -> bool:
+        """Whether a shape should prompt MobileSAM for the chosen label."""
+        if label in (None, '', '__all__'):
+            return True
+        return (shape.get('label') or '') == label
+
+    def _applyMobileSamResult(self, result: dict, *, remove_boxes: bool = False):
+        """Add the generated polygons to each image, dropping their prompts."""
+        results = result.get('results') or {}
+        tasks = {task['image_id']: task for task in (result.get('tasks') or [])}
+        fallback_label = result.get('label')
+        added = 0
+        removed = 0
+        others_changed = False
+
+        for image_id, entries in results.items():
+            if not entries:
+                continue
+            image = get_image(image_id)
+            if not image:
+                continue
+
+            task = tasks.get(image_id) or {}
+            source_shapes = list(task.get('shapes') or [])
+            prompts = task.get('prompts') or []
+
+            # Which prompts actually produced a mask, identified by identity of
+            # the box rather than list position, so a concurrent edit cannot
+            # make us delete the wrong shape.
+            used = set()
+            for prompt_index, _label, _polygon in entries:
+                if 0 <= prompt_index < len(prompts):
+                    used.add(prompt_index)
+
+            if remove_boxes:
+                # Only rectangles: a hand-drawn polygon may carry detail the
+                # mask does not reproduce.
+                doomed = [
+                    id(prompts[i]['shape'])
+                    for i in used
+                    if prompts[i].get('removable')
+                ]
+                kept = [s for s in source_shapes if id(s) not in doomed]
+                removed += len(source_shapes) - len(kept)
+                source_shapes = kept
+
+            new_shapes = list(source_shapes) + [
+                {
+                    'label': label or fallback_label or 'object',
+                    'points': polygon,
+                    'group_id': None,
+                    'description': '',
+                    'shape_type': 'polygon',
+                    'flags': {},
+                    'mask': None,
+                }
+                for _index, label, polygon in entries
+            ]
+
+            if image_id == self.current_image_id:
+                # applyShapes keeps the undo history, so both the new masks and
+                # the removed prompts can be undone with Ctrl+Z.
+                self.canvas.applyShapes(new_shapes)
+                added += len(entries)
+            else:
+                self._saveShapesForImage(image, new_shapes)
+                added += len(entries)
+                others_changed = True
+
+        if others_changed:
+            # Other images were written straight to the database; refresh the
+            # grid so their thumbnails stop showing stale annotations.
+            self._syncGridAnnotations()
+
+        device = result.get('device')
+        suffix = f" on {device}" if device else ""
+        if added:
+            detail = f"MobileSAM added {added} shape(s){suffix}"
+            if removed:
+                detail += f", removed {removed} box(es)"
+            self.status_bar.showMessage(detail, 5000)
+        else:
+            self.status_bar.showMessage(
+                "MobileSAM produced no usable masks", 4000
+            )
+
+    def _saveShapesForImage(self, image: dict, shapes: List[dict]):
+        """Persist shapes for an image that is not currently open."""
+        payload = build_labelme_payload(
+            shapes=shapes,
+            image_path=self._labelImagePath(image),
+            image_width=image['width'] or 0,
+            image_height=image['height'] or 0,
+        )
+        save_annotation(image['id'], payload)
+        update_image(image['id'], has_annotation=1)
+        self._writeLabelFile(image, payload)
+
+    def _runBackgroundJob(self, job_type: str, worker, on_done, on_error,
+                          *, title: str) -> str:
+        """Run ``worker`` off the UI thread and report its outcome.
+
+        The job queue injects a ``progress_callback`` keyword argument, so
+        workers must accept one. Signals are queued to the main thread, so
+        connecting after ``enqueue`` cannot miss the result.
+        """
+        holder: dict = {}
+
+        def run(progress_callback=None):
+            try:
+                holder['result'] = worker(progress_callback=progress_callback)
+                return {'ok': True}
+            except Exception as exc:  # reported through the job's error signal
+                holder['error'] = str(exc)
+                raise
+
+        if job_type == 'mobile_sam' and self._auto_annotate_dialog is not None:
+            self._auto_annotate_dialog.setMobileSamRunning(True)
+
+        job_id = self.job_queue.enqueue(job_type, run)
+        holder['job_id'] = job_id
+
+        def finished(finished_id: str, _result: dict):
+            if finished_id != job_id:
+                return
+            self._detachJobHandlers(finished, failed)
+            on_done(holder.get('result'))
+            # Drop the entry only after the callback ran: the holder is what
+            # keeps these closures alive for the signal connection.
+            self._managed_jobs.pop(job_id, None)
+            self._finishManagedJob(job_type)
+
+        def failed(failed_id: str, message: str):
+            if failed_id != job_id:
+                return
+            self._detachJobHandlers(finished, failed)
+            on_error(holder.get('error') or message)
+            self._managed_jobs.pop(job_id, None)
+            self._finishManagedJob(job_type)
+
+        holder['handlers'] = (finished, failed)
+        self._managed_jobs[job_id] = holder
+        self.job_queue.jobFinished.connect(finished)
+        self.job_queue.jobFailed.connect(failed)
+        return job_id
+
+    def _detachJobHandlers(self, finished, failed):
+        """Disconnect a job's one-shot result handlers."""
+        try:
+            self.job_queue.jobFinished.disconnect(finished)
+        except (RuntimeError, TypeError):
+            pass
+        try:
+            self.job_queue.jobFailed.disconnect(failed)
+        except (RuntimeError, TypeError):
+            pass
+
+    def _finishManagedJob(self, job_type: str):
+        """Clear per-job UI state once a self-managed job settles."""
+        if job_type == 'mobile_sam':
+            self._mobile_sam_job = None
+            if self._auto_annotate_dialog is not None:
+                self._auto_annotate_dialog.setMobileSamRunning(False)
     
     def onJobStarted(self, job_id: str):
+        if job_id in self._managed_jobs:
+            # Managed jobs drive their own dialog instead of the modal
+            # progress window.
+            if self._auto_annotate_dialog is not None:
+                self._auto_annotate_dialog.setProgress(0, "Starting...")
+            return
         self.showProgressDialog(f"Job {job_id}", "Starting...")
     
     def onJobProgress(self, job_id: str, progress: int, message: str):
+        if job_id in self._managed_jobs:
+            if self._auto_annotate_dialog is not None:
+                self._auto_annotate_dialog.setProgress(progress, message)
+            return
         if self.progress_dialog:
             self.progress_dialog.setProgress(progress, message)
     
     def onJobFinished(self, job_id: str, result: dict):
+        if job_id in self._managed_jobs:
+            # Self-managed jobs report through their own callbacks, which also
+            # own the cleanup of this entry.
+            return
         self.hideProgressDialog()
         self.handleAutoAnnotateResult(job_id, result)
         QMessageBox.information(self, "Complete", f"Job {job_id} completed.")
     
     def onJobFailed(self, job_id: str, error: str):
+        if job_id in self._managed_jobs:
+            return
         self.hideProgressDialog()
         QMessageBox.critical(self, "Job Failed", f"Job {job_id} failed:\n{error}")
     
@@ -919,8 +1409,7 @@ class MainWindow(QMainWindow):
         if 'annotations' in result and self.current_image_id:
             self.canvas.loadShapes(result['annotations'])
             self.syncLabelsFromShapes()
-            self.annotations_dirty = True
-            self.toolbar.setSaveEnabled(True)
+            self._markDirty()
     
     # Export
     def exportDataset(self):
@@ -1006,6 +1495,7 @@ class MainWindow(QMainWindow):
             settings.setValue("sidebar_width", self.main_splitter.sizes()[0])
     
     def closeEvent(self, event):
+        self._flushAutosave()
         if self.current_project_id and self.annotations_dirty:
             reply = QMessageBox.question(
                 self, "Unsaved Changes",

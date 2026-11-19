@@ -92,7 +92,7 @@ SUPPORTED_IMAGE_FORMATS = {
 # Export formats
 EXPORT_FORMATS = {
     'yolo': 'YOLO (.txt + data.yaml)',
-    'coco': 'COCO (.json)',
+    'labelme': 'LabelMe (.json)',
 }
 
 # Job types

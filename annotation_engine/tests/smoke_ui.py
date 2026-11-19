@@ -117,6 +117,77 @@ check("grid model exposes index badge value",
       grid.model.data(grid.model.index(0, 0), Qt.UserRole + 1) == 1)
 
 
+# --------------------------------------------------------- label overlays
+from annotation_engine.ui.colors import resolve_label_color
+
+# Batch annotation loader roundtrip.
+pid = dbm.create_project("Overlay", TMP / "projects")
+b2 = Path(dbm.get_project(pid)["base_path"])
+(b2 / "images").mkdir(parents=True, exist_ok=True)
+ov_id = dbm.add_image(pid, "ov.png", "images/ov.png", 100, 100)
+ov_pm = QPixmap(100, 100)
+ov_pm.fill(QColor("white"))
+ov_pm.save(str(b2 / "images" / "ov.png"))
+dbm.save_annotation(ov_id, {
+    "shapes": [
+        {"label": "box", "shape_type": "rectangle",
+         "points": [[10, 10], [50, 60]]},
+        {"label": "hidden", "shape_type": "point", "points": [[5, 5]]},
+    ],
+    "imagePath": "ov.png",
+})
+annotations = dbm.get_project_annotations(pid)
+check("batch annotations keyed by image id",
+      annotations.get(ov_id) is not None
+      and len(annotations[ov_id]) == 2, annotations)
+
+# Overlay compositing in the model: with overlays off, base pixmap returned;
+# with overlays on and shapes present, a distinct pixmap is produced.
+ov_model = ImageGridModel([{
+    "id": ov_id, "project_id": pid, "filename": "ov.png",
+    "relative_path": "images/ov.png", "split": "train",
+    "width": 100, "height": 100, "has_annotation": True,
+}])
+ov_model.setAnnotationData(
+    annotations=annotations,
+    label_colors={"box": "#ff0000", "hidden": "#00ff00"},
+    label_visibility={"box": True, "hidden": False},
+)
+
+base_pm = ov_model.getThumbnail(ov_model.images[0])
+check("overlay base thumbnail exists", base_pm is not None and not base_pm.isNull())
+
+ov_model.setShowOverlays(True)
+composed = ov_model.getOverlayThumbnail(ov_model.images[0])
+check("overlay produces a pixmap", composed is not None and not composed.isNull())
+
+# Rectangle regression: a rectangle (2 corner points) must fill a rectangular
+# region, not collapse into a diagonal line. Sample two interior points that
+# sit off the top-left -> bottom-right diagonal.
+if composed is not None and not composed.isNull():
+    img = composed.toImage()
+    base_img = base_pm.toImage()
+    sx = composed.width() / 100.0
+    sy = composed.height() / 100.0
+    changed = []
+    for (ix, iy) in ((30, 20), (30, 40), (40, 30)):
+        px = int(ix * sx)
+        py = int(iy * sy)
+        if (0 <= px < img.width() and 0 <= py < img.height()):
+            c = img.pixelColor(px, py)
+            b = base_img.pixelColor(px, py)
+            changed.append(c != b)
+    check("rectangle fills a 2D region (not a diagonal line)",
+          all(changed) and len(changed) >= 3, changed)
+
+# Hidden labels must be skipped: a point-only hidden shape leaves no mark, so
+# the composed pixmap differs from base only because of the visible rectangle.
+check("resolve_label_color returns configured color",
+      resolve_label_color("box", {"box": "#ff0000"}).name() == "#ff0000")
+check("resolve_label_color falls back to palette",
+      resolve_label_color("zzz_unknown", {}).isValid())
+
+
 # --------------------------------------------------------------- title bar
 import annotation_engine.ui.main_window as mw
 mw.MainWindow.showWelcomeDialog = lambda self: None

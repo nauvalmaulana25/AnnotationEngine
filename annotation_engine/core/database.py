@@ -320,6 +320,30 @@ def delete_annotation(image_id: int) -> bool:
     cursor = db.execute("DELETE FROM annotations WHERE image_id = ?", (image_id,))
     return cursor.rowcount > 0
 
+
+def get_project_annotations(project_id: int) -> Dict[int, List[Dict]]:
+    """Return every saved shape, keyed by image id, for a project.
+
+    Loads all annotations in one query (rather than one per image) so the image
+    grid can render overlays without an N+1 fetch on the UI thread.
+    """
+    db = get_database()
+    rows = db.fetch_all(
+        """SELECT a.image_id, a.data FROM annotations a
+           JOIN images i ON i.id = a.image_id
+           WHERE i.project_id = ?""",
+        (project_id,)
+    )
+
+    result: Dict[int, List[Dict]] = {}
+    for row in rows:
+        try:
+            data = json.loads(row['data'])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        result[int(row['image_id'])] = list(data.get('shapes') or [])
+    return result
+
 # Project label metadata
 def get_project_labels(project_id: int) -> List[Dict]:
     """Return persisted label metadata for a project."""

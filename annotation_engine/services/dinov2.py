@@ -10,19 +10,24 @@ from typing import List, Dict, Any, Optional, Callable, Tuple
 from pathlib import Path
 import numpy as np
 
+from annotation_engine.services.device import DEVICE_AUTO, torch_device
+
 
 class DINOv2KeypointService:
     """DINOv2-based zero-shot keypoint transfer."""
     
-    def __init__(self, model_name: str = "facebook/dinov2-small"):
+    def __init__(self, model_name: str = "facebook/dinov2-small",
+                 device: str = DEVICE_AUTO):
         """
         Initialize DINOv2 keypoint service.
         
         Args:
             model_name: Hugging Face model name (dinov2-small, dinov2-base, dinov2-large, dinov2-giant)
+            device: Inference device preference (``auto``, ``cpu``, ``cuda:0``…)
         """
         self.model_name = model_name
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device_preference = device
+        self.device = torch_device(device)
         
         print(f"Loading DINOv2 model: {model_name} on {self.device}")
         

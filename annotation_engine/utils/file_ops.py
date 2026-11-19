@@ -78,30 +78,63 @@ def copy_image_to_project(
         return None
 
 
+def build_labelme_payload(
+    shapes: List[Dict],
+    image_path: str,
+    image_width: int,
+    image_height: int,
+    version: str = "5.4.1",
+) -> Dict[str, Any]:
+    """Build a LabelMe JSON document with LabelMe's exact key set.
+
+    The key order and names mirror what LabelMe itself writes (camelCase,
+    ``imageData`` last but one), so the file opens in LabelMe unchanged.
+    ``image_path`` is stored as given; LabelMe resolves it relative to the
+    label file, so callers pass a path relative to the ``labels`` directory.
+    """
+    return {
+        "version": version,
+        "flags": {},
+        "shapes": list(shapes or []),
+        "imagePath": image_path,
+        "imageData": None,
+        "imageHeight": image_height,
+        "imageWidth": image_width,
+    }
+
+
+def write_labelme_json(payload: Dict, output_path: Path) -> bool:
+    """Write a LabelMe JSON document atomically, matching LabelMe's indent."""
+    try:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        # Write to a sibling temp file first so a crash mid-write cannot leave
+        # a truncated label file behind.
+        tmp_path = output_path.with_name(output_path.name + ".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+        os.replace(tmp_path, output_path)
+        return True
+    except Exception:
+        return False
+
+
 def export_labelme_json(
     shapes: List[Dict],
     image_path: Path,
     image_width: int,
     image_height: int,
-    output_path: Path
+    output_path: Path,
+    relative_image_path: Optional[str] = None,
 ) -> bool:
-    """Export shapes to LabelMe JSON format."""
-    try:
-        data = {
-            "version": "5.4.1",
-            "flags": {},
-            "shapes": shapes,
-            "imagePath": image_path.name,
-            "imageData": None,
-            "imageHeight": image_height,
-            "imageWidth": image_width
-        }
-        
-        with open(output_path, 'w') as f:
-            json.dump(data, f, indent=2)
-        return True
-    except Exception:
-        return False
+    """Export shapes to a LabelMe JSON file."""
+    payload = build_labelme_payload(
+        shapes=shapes,
+        image_path=relative_image_path or image_path.name,
+        image_width=image_width,
+        image_height=image_height,
+    )
+    return write_labelme_json(payload, output_path)
 
 
 def import_labelme_json(json_path: Path) -> Optional[Dict]:

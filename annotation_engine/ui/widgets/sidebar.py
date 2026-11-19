@@ -41,6 +41,23 @@ class SidebarWidget(QWidget):
     def setImages(self, images: List[Dict]):
         """Set images in grid."""
         self.image_grid.setImages(images)
+
+    def setAnnotationData(
+        self,
+        annotations: Dict[int, List[dict]] = None,
+        label_colors: Dict[str, str] = None,
+        label_visibility: Dict[str, bool] = None,
+    ):
+        """Feed annotation shapes and label metadata into the grid."""
+        self.image_grid.setAnnotationData(
+            annotations=annotations,
+            label_colors=label_colors,
+            label_visibility=label_visibility,
+        )
+
+    def invalidateOverlay(self, image_id: int):
+        """Refresh a single image's overlay."""
+        self.image_grid.invalidateOverlay(image_id)
     
     def clear(self):
         """Clear images."""

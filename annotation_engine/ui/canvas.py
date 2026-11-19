@@ -12,6 +12,7 @@ from PySide6.QtGui import QAction, QColor, QPixmap
 from PySide6.QtWidgets import QInputDialog, QMenu
 
 from annotation_engine.config import ANNOTATION_COLORS, ANNOTATION_SETTINGS
+from annotation_engine.ui.colors import resolve_label_color
 
 # Import LabelMe components. LabelMe >= 7 uses the private package layout and a
 # numpy based Shape model; the fallback keeps old (vendored) LabelMe working.
@@ -462,11 +463,7 @@ class AnnotationCanvas(LabelMeCanvas):
         self.update()
 
     def _resolveShapeColor(self, label: str) -> tuple:
-        color = self.label_colors.get(label, "")
-        qcolor = QColor(color) if color else QColor()
-        if not qcolor.isValid():
-            index = sum(ord(char) for char in (label or "shape"))
-            qcolor = QColor(ANNOTATION_COLORS[index % len(ANNOTATION_COLORS)])
+        qcolor = resolve_label_color(label, self.label_colors)
         return (qcolor.red(), qcolor.green(), qcolor.blue())
 
     # ------------------------------------------------------------------
@@ -886,6 +883,38 @@ class AnnotationCanvas(LabelMeCanvas):
     def getShapesData(self) -> List[dict]:
         """Get all shapes as LabelMe JSON format."""
         return [self._shapeToDict(shape) for shape in self.shapes]
+
+    def appendShapes(self, shapes_data: List[dict]) -> int:
+        """Append LabelMe shape dicts as a single undoable edit.
+
+        Unlike :meth:`loadShapes`, this keeps the undo history, so generated
+        shapes (for example MobileSAM masks) can be undone with Ctrl+Z.
+        """
+        new_shapes = []
+        for shape_data in shapes_data or []:
+            try:
+                new_shapes.append(self._dictToShape(shape_data))
+            except Exception as e:
+                print(f"[Canvas] Failed to append shape: {e}")
+        if not new_shapes:
+            return 0
+        self._commitShapes(list(self.shapes) + new_shapes, select=new_shapes)
+        return len(new_shapes)
+
+    def applyShapes(self, shapes_data: List[dict]) -> int:
+        """Replace the whole shape list as a single undoable edit.
+
+        Generated batches need this rather than :meth:`appendShapes` because
+        they may also *remove* the prompts that produced them.
+        """
+        shapes = []
+        for shape_data in shapes_data or []:
+            try:
+                shapes.append(self._dictToShape(shape_data))
+            except Exception as e:
+                print(f"[Canvas] Failed to apply shape: {e}")
+        self._commitShapes(shapes, select=[])
+        return len(shapes)
 
     def clear(self):
         """Clear all shapes and image."""

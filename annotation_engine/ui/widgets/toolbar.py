@@ -8,9 +8,15 @@ from PySide6.QtWidgets import (
     QComboBox, QSpinBox, QWidgetAction, QSizePolicy
 )
 from PySide6.QtCore import Signal, Slot, Qt, QSize
-from PySide6.QtGui import QIcon, QKeySequence, QAction
+from PySide6.QtGui import QIcon, QAction
 
-from annotation_engine.config import TOOL_NAMES, SHORTCUTS, COLORS
+from annotation_engine.config import TOOL_NAMES, SHORTCUTS, COLORS, ICONS_DIR
+
+
+def _icon(name: str) -> QIcon:
+    """Load a toolbar icon, or an empty one when the resource is missing."""
+    icon_path = ICONS_DIR / name
+    return QIcon(str(icon_path)) if icon_path.exists() else QIcon()
 
 
 class AnnotationToolbar(QToolBar):
@@ -22,7 +28,6 @@ class AnnotationToolbar(QToolBar):
     importLabelsRequested = Signal()
     exportRequested = Signal()
     autoAnnotateRequested = Signal()
-    saveRequested = Signal()
     undoRequested = Signal()
     redoRequested = Signal()
     deleteRequested = Signal()
@@ -37,7 +42,6 @@ class AnnotationToolbar(QToolBar):
         
         self.current_tool = "select"
         self.project_loaded = False
-        self.save_enabled = False
         
         self.setupUI()
     
@@ -53,7 +57,7 @@ class AnnotationToolbar(QToolBar):
         ]
         
         for tool_id, label, shortcut, icon_name in tools:
-            action = QAction(label, self)
+            action = QAction(_icon(f"{icon_name}.svg"), label, self)
             # The Tools menu owns the shortcut; duplicating it here makes Qt
             # report an ambiguous shortcut overload and fires neither action.
             action.setCheckable(True)
@@ -65,60 +69,49 @@ class AnnotationToolbar(QToolBar):
         
         self.tool_actions["select"].setChecked(True)
         
-        self.addSeparator()
-        
-        # Import/Export actions
-        import_images_action = QAction("Import Images", self)
-        import_images_action.setToolTip("Import Images (Ctrl+I)")
-        import_images_action.triggered.connect(self.importImagesRequested)
-        self.addAction(import_images_action)
-        
-        import_labels_action = QAction("Import Labels", self)
-        import_labels_action.setToolTip("Import Labels")
-        import_labels_action.triggered.connect(self.importLabelsRequested)
-        self.addAction(import_labels_action)
-        
-        self.addSeparator()
-        
-        export_action = QAction("Export Dataset", self)
-        export_action.setToolTip("Export Dataset (Ctrl+E)")
-        export_action.triggered.connect(self.exportRequested)
-        self.addAction(export_action)
-        
-        self.addSeparator()
-        
-        # Auto-annotate
-        auto_annotate_action = QAction("Auto Annotate", self)
+        # Auto-annotate: it creates shapes like the tools above, so it belongs
+        # in the tool group rather than between Export and Save.
+        auto_annotate_action = QAction(_icon("sparkles.svg"), "Auto Annotate", self)
         auto_annotate_action.setToolTip("Auto Annotate (Ctrl+Shift+A)")
         auto_annotate_action.triggered.connect(self.autoAnnotateRequested)
         self.addAction(auto_annotate_action)
         
         self.addSeparator()
         
-        # Save action
-        self.save_action = QAction("Save Annotation", self)
-        self.save_action.setShortcut(QKeySequence.Save)
-        self.save_action.setToolTip("Save Annotation (Ctrl+S)")
-        self.save_action.setEnabled(False)
-        self.save_action.triggered.connect(self.saveRequested)
-        self.addAction(self.save_action)
+        # Import/Export actions
+        import_images_action = QAction(_icon("image-plus.svg"), "Import Images", self)
+        import_images_action.setToolTip("Import Images (Ctrl+I)")
+        import_images_action.triggered.connect(self.importImagesRequested)
+        self.addAction(import_images_action)
+        
+        import_labels_action = QAction(_icon("tags.svg"), "Import Labels", self)
+        import_labels_action.setToolTip("Import Labels")
+        import_labels_action.triggered.connect(self.importLabelsRequested)
+        self.addAction(import_labels_action)
+        
+        self.addSeparator()
+        
+        export_action = QAction(_icon("download.svg"), "Export Dataset", self)
+        export_action.setToolTip("Export Dataset (Ctrl+E)")
+        export_action.triggered.connect(self.exportRequested)
+        self.addAction(export_action)
         
         self.addSeparator()
         
         # Undo/Redo (menu actions own the keyboard shortcuts)
-        self.undo_action = QAction("Undo", self)
+        self.undo_action = QAction(_icon("undo.svg"), "Undo", self)
         self.undo_action.setToolTip("Undo (Ctrl+Z)")
         self.undo_action.setEnabled(False)
         self.undo_action.triggered.connect(self.undoRequested)
         self.addAction(self.undo_action)
         
-        self.redo_action = QAction("Redo", self)
+        self.redo_action = QAction(_icon("redo.svg"), "Redo", self)
         self.redo_action.setToolTip("Redo (Ctrl+Shift+Z)")
         self.redo_action.setEnabled(False)
         self.redo_action.triggered.connect(self.redoRequested)
         self.addAction(self.redo_action)
 
-        self.delete_action = QAction("Delete", self)
+        self.delete_action = QAction(_icon("trash.svg"), "Delete", self)
         self.delete_action.setToolTip("Delete selected shapes (Del)")
         self.delete_action.setEnabled(False)
         self.delete_action.triggered.connect(self.deleteRequested)
@@ -143,7 +136,7 @@ class AnnotationToolbar(QToolBar):
         self.addSeparator()
         
         # Welcome / Project screen action
-        self.welcome_action = QAction("Welcome Screen", self)
+        self.welcome_action = QAction(_icon("home.svg"), "Welcome Screen", self)
         self.welcome_action.setToolTip("Return to Welcome Screen (Ctrl+Shift+W)")
         self.welcome_action.triggered.connect(self.welcomeRequested)
         self.addAction(self.welcome_action)
@@ -158,8 +151,12 @@ class AnnotationToolbar(QToolBar):
     
     def setTool(self, tool_id: str):
         """Set current tool programmatically."""
-        if tool_id in self.tool_actions:
-            self.tool_actions[tool_id].setChecked(True)
+        if tool_id not in self.tool_actions:
+            return
+        # The tools are exclusive, so clear the siblings here too: menu items
+        # and shortcuts reach this path without going through onToolAction.
+        for tid, action in self.tool_actions.items():
+            action.setChecked(tid == tool_id)
     
     def setProjectLoaded(self, loaded: bool):
         """Update UI for project loaded state."""
@@ -168,17 +165,12 @@ class AnnotationToolbar(QToolBar):
         # Enable/disable actions based on project state. Undo/redo stay under
         # the canvas history signal so they cannot be wrongly re-enabled.
         for action in self.actions():
-            if action.data() in TOOL_NAMES or action is self.save_action:
+            if action.data() in TOOL_NAMES:
                 action.setEnabled(loaded)
         if not loaded:
             self.undo_action.setEnabled(False)
             self.redo_action.setEnabled(False)
             self.delete_action.setEnabled(False)
-    
-    def setSaveEnabled(self, enabled: bool):
-        """Enable/disable save action."""
-        self.save_enabled = enabled
-        self.save_action.setEnabled(enabled and self.project_loaded)
     
     def setSelectionCount(self, count: int):
         """Update selection count label."""

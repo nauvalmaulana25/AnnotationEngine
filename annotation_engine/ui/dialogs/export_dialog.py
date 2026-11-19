@@ -7,9 +7,12 @@ from typing import Dict
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGroupBox, QLabel,
     QPushButton, QFileDialog, QCheckBox, QSpinBox, QRadioButton,
-    QLineEdit, QProgressBar, QFormLayout, QMessageBox
+    QLineEdit, QProgressBar, QFormLayout, QMessageBox, QApplication
 )
 from PySide6.QtCore import Qt
+
+from annotation_engine.core.database import get_project
+from annotation_engine.services.export_service import ExportService
 
 
 class ExportDialog(QDialog):
@@ -37,8 +40,8 @@ class ExportDialog(QDialog):
         self.format_yolo.setChecked(True)
         format_layout.addWidget(self.format_yolo)
         
-        self.format_coco = QCheckBox("COCO (.json)")
-        format_layout.addWidget(self.format_coco)
+        self.format_labelme = QCheckBox("LabelMe (.json)")
+        format_layout.addWidget(self.format_labelme)
         
         layout.addWidget(format_group)
         
@@ -132,6 +135,74 @@ class ExportDialog(QDialog):
             self.output_path.setText(path)
     
     def doExport(self):
-        # Export logic here
-        QMessageBox.information(self, "Export", "Export functionality not yet implemented.")
-        self.accept()
+        """Run the selected export(s) into the chosen output directory."""
+        if not self.project_id:
+            QMessageBox.warning(self, "Export", "No project is open.")
+            return
+
+        want_yolo = self.format_yolo.isChecked()
+        want_labelme = self.format_labelme.isChecked()
+        if not want_yolo and not want_labelme:
+            QMessageBox.warning(self, "Export", "Select at least one format.")
+            return
+
+        if self.output_custom.isChecked():
+            target = self.output_path.text().strip()
+            if not target:
+                QMessageBox.warning(self, "Export", "Choose an output folder.")
+                return
+            output_dir = Path(target)
+        else:
+            project = get_project(self.project_id)
+            if not project:
+                QMessageBox.warning(self, "Export", "Project not found.")
+                return
+            output_dir = Path(project['base_path']) / 'exports'
+
+        ratios = {
+            'train': self.split_train.value() / 100,
+            'val': self.split_val.value() / 100,
+            'test': self.split_test.value() / 100,
+        }
+
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.export_btn.setEnabled(False)
+        QApplication.processEvents()
+
+        def report(percent, message):
+            self.progress_bar.setValue(int(percent))
+            self.progress_bar.setFormat(f"{message} (%p%)")
+            QApplication.processEvents()
+
+        service = ExportService(self.project_id)
+        ok = True
+        try:
+            if want_yolo:
+                ok = service.export_yolo(
+                    output_dir / 'yolo',
+                    ratios,
+                    include_bboxes=self.include_bbox.isChecked(),
+                    include_polygons=self.include_polygon.isChecked(),
+                    include_keypoints=self.include_keypoints.isChecked(),
+                    progress_callback=report,
+                ) and ok
+            if want_labelme:
+                ok = service.export_labelme(
+                    output_dir / 'labelme',
+                    copy_images=True,
+                    progress_callback=report,
+                ) and ok
+        finally:
+            self.progress_bar.setVisible(False)
+            self.export_btn.setEnabled(True)
+
+        if ok:
+            QMessageBox.information(
+                self, "Export", f"Export finished:\n{output_dir}"
+            )
+            self.accept()
+        else:
+            QMessageBox.critical(
+                self, "Export", "Export failed. Check the log for details."
+            )

@@ -1,248 +1,378 @@
 """
 AnnotationEngine Desktop - MobileSAM Service
+
+Box-prompted segmentation backed by Ultralytics' MobileSAM build. Ultralytics
+ships the ``mobile_sam.pt`` architecture and its downloader, so no additional
+package beyond ``ultralytics`` (already a dependency) is required.
 """
 import os
+import logging
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Tuple
+
 import cv2
 import numpy as np
-import onnxruntime as ort
-from pathlib import Path
-from typing import List, Dict, Any, Optional, Callable, Tuple
+
+from annotation_engine.services.device import (
+    DEVICE_AUTO,
+    DEVICE_CPU,
+    describe_device,
+    resolve_device,
+    ultralytics_device,
+)
+from annotation_engine.services.model_manager import (
+    ModelDownloadError,
+    ensure_mobile_sam,
+    mobile_sam_path,
+    mobile_sam_status,
+)
+
+ProgressCallback = Optional[Callable[[int, str], None]]
+
+logger = logging.getLogger(__name__)
+
+# Minimum contour area in pixels; drops speckle the model sometimes emits.
+MIN_MASK_AREA = 16.0
+# Contour simplification, as a fraction of the contour perimeter.
+CONTOUR_EPSILON_RATIO = 0.002
+
+
+def _report(progress_callback: ProgressCallback, percent: int, message: str):
+    if progress_callback is not None:
+        progress_callback(percent, message)
+
+
+def mask_to_polygon(mask: np.ndarray) -> List[List[float]]:
+    """Convert a binary mask into a simplified polygon.
+
+    The canvas renders polygons (it has no mask renderer), and LabelMe reads
+    polygons natively, so this keeps generated shapes visible and editable.
+    Returns an empty list when the mask has no usable contour.
+    """
+    binary = (np.asarray(mask) > 0.5).astype(np.uint8)
+    contours, _ = cv2.findContours(
+        binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    if not contours:
+        return []
+
+    contour = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(contour) < MIN_MASK_AREA:
+        return []
+
+    epsilon = CONTOUR_EPSILON_RATIO * cv2.arcLength(contour, True)
+    simplified = cv2.approxPolyDP(contour, epsilon, True)
+
+    points = [[float(pt[0][0]), float(pt[0][1])] for pt in simplified]
+    # A polygon needs at least three points to be drawable.
+    return points if len(points) >= 3 else []
 
 
 class MobileSAMService:
-    """MobileSAM instance segmentation via ONNX Runtime."""
-    
-    def __init__(self, model_path: str = ""):
+    """MobileSAM instance segmentation driven by bounding-box prompts."""
+
+    def __init__(self, model_path: Optional[str] = None, *, auto_download: bool = True,
+                 device: str = DEVICE_AUTO):
         """
-        Initialize MobileSAM service.
-        
         Args:
-            model_path: Path to mobile_sam.onnx file
+            model_path: Path to the ``mobile_sam.pt`` checkpoint. Defaults to
+                ``MODELS_DIR/mobile_sam.pt``.
+            auto_download: Fetch the checkpoint when it is missing.
+            device: Inference device preference (``auto``, ``cpu``, ``cuda:0``…).
+                Resolved once here so a run cannot change device mid-flight.
         """
-        if not model_path:
-            # Default to models directory
-            from annotation_engine.config import MODELS_DIR
-            model_path = MODELS_DIR / "mobile_sam.onnx"
-        
-        self.model_path = str(model_path)
-        self.session = None
-        self._initialize_session()
-    
-    def _initialize_session(self):
-        """Initialize ONNX Runtime session."""
-        if not os.path.exists(self.model_path):
+        self.model_path = str(model_path or mobile_sam_path())
+        self.auto_download = auto_download
+        self.device_preference = device
+        self.device = resolve_device(device)
+        self._model = None
+
+    @property
+    def device_description(self) -> str:
+        """Human-readable name of the device in use."""
+        return describe_device(self.device)
+
+    def _is_cuda(self) -> bool:
+        return self.device.startswith("cuda")
+
+    # ------------------------------------------------------------------
+    # Model lifecycle
+    # ------------------------------------------------------------------
+    @staticmethod
+    def status() -> dict:
+        """Report whether the checkpoint is present, without loading it."""
+        return mobile_sam_status()
+
+    def ensure_model(self, progress_callback: ProgressCallback = None):
+        """Return the checkpoint path, downloading it when allowed."""
+        if os.path.isfile(self.model_path):
+            return self.model_path
+        if not self.auto_download:
             raise FileNotFoundError(
                 f"MobileSAM model not found at {self.model_path}. "
-                "Please run scripts/export_mobile_sam.py to generate it."
+                "Enable automatic download or place the file there manually."
             )
-        
-        # Use CPU execution provider
-        self.session = ort.InferenceSession(
-            self.model_path,
-            providers=['CPUExecutionProvider']
+        _report(progress_callback, 0, "Preparing MobileSAM model")
+        try:
+            path = ensure_mobile_sam(progress_callback)
+        except ModelDownloadError as exc:
+            raise FileNotFoundError(str(exc)) from exc
+        self.model_path = str(path)
+        return self.model_path
+
+    def load(self, progress_callback: ProgressCallback = None):
+        """Load the Ultralytics SAM wrapper, reusing it across calls.
+
+        The import is deferred: ``ultralytics`` pulls in torch, which is far too
+        slow to pay for at application startup.
+        """
+        if self._model is not None:
+            return self._model
+
+        path = self.ensure_model(progress_callback)
+        _report(
+            progress_callback, 100,
+            f"Loading MobileSAM on {self.device_description}"
         )
-        
-        # Get input/output names
-        self.input_name = self.session.get_inputs()[0].name
-        self.output_names = [out.name for out in self.session.get_outputs()]
-        
-        print(f"MobileSAM loaded: {self.model_path}")
-        print(f"Input: {self.input_name}")
-        print(f"Outputs: {self.output_names}")
-    
-    def preprocess(self, image: np.ndarray) -> Tuple[np.ndarray, Tuple[int, int]]:
+        from ultralytics import SAM
+
+        # An absolute path is required: Ultralytics otherwise resolves bare
+        # filenames against its own global weights directory, which belongs to
+        # whatever project first ran it.
+        self._model = SAM(str(Path(path).resolve()))
+        self._move_to_device(self._model)
+        return self._model
+
+    def _move_to_device(self, model):
+        """Place the network on the resolved device before the first predict.
+
+        Ultralytics loads on CPU and migrates lazily, which makes the first
+        image pay the transfer on top of the encoder pass.
         """
-        Preprocess image for MobileSAM encoder.
-        
-        Returns:
-            (preprocessed_tensor, original_size)
-        """
-        h, w = image.shape[:2]
-        
-        # Resize to 1024x1024 maintaining aspect ratio
-        scale = 1024 / max(h, w)
-        new_h, new_w = int(h * scale), int(w * scale)
-        
-        # Resize
-        resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-        
-        # Pad to 1024x1024
-        padded = np.zeros((1024, 1024, 3), dtype=np.uint8)
-        padded[:new_h, :new_w] = resized
-        
-        # Normalize (ImageNet stats)
-        normalized = padded.astype(np.float32) / 255.0
-        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-        normalized = (normalized - mean) / std
-        
-        # HWC to CHW, add batch dimension
-        tensor = np.transpose(normalized, (2, 0, 1))
-        tensor = np.expand_dims(tensor, 0).astype(np.float32)
-        
-        return tensor, (h, w)
-    
-    def encode_image(self, image: np.ndarray) -> np.ndarray:
-        """
-        Run image encoder to get image embeddings.
-        
-        Args:
-            image: BGR image as numpy array
-            
-        Returns:
-            Image embeddings from encoder
-        """
-        # Convert BGR to RGB
-        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        
-        # Preprocess
-        input_tensor, original_size = self.preprocess(image_rgb)
-        
-        # Run encoder
-        outputs = self.session.run(
-            self.output_names,
-            {self.input_name: input_tensor}
-        )
-        
-        # First output is typically image embeddings
-        image_embeddings = outputs[0]
-        
-        return image_embeddings, original_size
-    
+        try:
+            model.model.to(self.device)
+        except Exception as exc:  # e.g. a device that vanished mid-run
+            logger.warning(
+                "Could not move MobileSAM to %s (%s); falling back to CPU",
+                self.device, exc,
+            )
+            self.device = DEVICE_CPU
+            try:
+                model.model.to(DEVICE_CPU)
+            except Exception:
+                pass
+
+    def unload(self):
+        """Drop the loaded model so the next run reloads it."""
+        self._model = None
+
+    # ------------------------------------------------------------------
+    # Inference
+    # ------------------------------------------------------------------
     def segment_from_boxes(
         self,
         image: np.ndarray,
         boxes: List[List[float]],
-        image_embeddings: np.ndarray = None,
-        original_size: Tuple[int, int] = None,
-        progress_callback: Optional[Callable[[int, str], None]] = None
+        progress_callback: ProgressCallback = None,
+        min_score: float = 0.0,
     ) -> List[np.ndarray]:
-        """
-        Generate segmentation masks from bounding boxes.
-        
+        """Segment an image from ``[x1, y1, x2, y2]`` box prompts.
+
         Args:
-            image: Input image (BGR)
-            boxes: List of [x1, y1, x2, y2] in original image coordinates
-            image_embeddings: Pre-computed embeddings (optional)
-            original_size: Original image size (h, w) (optional)
-            progress_callback: Optional progress callback
-            
+            image: BGR image as a numpy array.
+            boxes: Boxes in original image pixel coordinates.
+            progress_callback: Optional ``(percent, message)`` reporter.
+            min_score: Drop masks whose confidence is below this value. The
+                model does not always report scores, in which case every mask
+                is kept.
+
         Returns:
-            List of binary masks (H, W) as boolean arrays
+            One boolean mask per input box, in the same order.
         """
-        if image_embeddings is None or original_size is None:
-            image_embeddings, original_size = self.encode_image(image)
-        
-        h, w = original_size
-        masks = []
-        
-        for i, box in enumerate(boxes):
-            if progress_callback:
-                progress_callback(
-                    int((i / len(boxes)) * 100),
-                    f"Segmenting box {i+1}/{len(boxes)}"
+        if not boxes:
+            return []
+
+        model = self.load(progress_callback)
+        _report(progress_callback, 0, f"Segmenting {len(boxes)} box(es)")
+
+        results = self._predict(model, image, boxes)
+        if not results:
+            return [np.zeros(image.shape[:2], dtype=bool) for _ in boxes]
+
+        height, width = image.shape[:2]
+        masks = results[0].masks
+        if masks is None or len(masks) == 0:
+            _report(progress_callback, 100, "No masks produced")
+            return [np.zeros((height, width), dtype=bool) for _ in boxes]
+
+        arrays = masks.data.cpu().numpy()
+        keep = self._scoreMask(results[0], len(arrays), min_score)
+        _report(progress_callback, 100, f"Generated {len(arrays)} mask(s)")
+
+        output: List[np.ndarray] = []
+        for array, wanted in zip(arrays, keep):
+            if array.shape[:2] != (height, width):
+                array = cv2.resize(
+                    array.astype(np.float32),
+                    (width, height),
+                    interpolation=cv2.INTER_LINEAR,
                 )
-            
-            # Convert box to 1024 scale
-            x1, y1, x2, y2 = box
-            scale_x, scale_y = 1024 / w, 1024 / h
-            box_1024 = np.array([
-                x1 * scale_x, y1 * scale_y,
-                x2 * scale_x, y2 * scale_y
-            ], dtype=np.float32)
-            
-            # Run decoder with box prompt
-            # Note: This depends on the specific ONNX export structure
-            # The decoder typically takes: image_embeddings, box_prompts
-            mask = self._run_decoder(image_embeddings, box_1024)
-            
-            # Resize mask to original image size
-            mask = cv2.resize(mask.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
-            mask = (mask > 0.5).astype(np.bool_)
-            
-            masks.append(mask)
-        
-        if progress_callback:
-            progress_callback(100, f"Generated {len(masks)} masks")
-        
-        return masks
-    
-    def _run_decoder(self, image_embeddings: np.ndarray, box_prompt: np.ndarray) -> np.ndarray:
+            # A filtered mask still occupies its slot, so the result stays
+            # aligned with the prompt boxes.
+            output.append((array > 0.5) if wanted else np.zeros((height, width), dtype=bool))
+        return output
+
+    def _predict(self, model, image: np.ndarray, boxes: List[List[float]]):
+        """Run ``predict`` on the resolved device, falling back on OOM.
+
+        A GPU that runs out of memory mid-run would otherwise fail the whole
+        batch; retrying the image on CPU keeps the run productive.
         """
-        Run MobileSAM decoder with box prompt.
-        
-        Note: This is a simplified implementation. The actual decoder inputs
-        depend on how the ONNX model was exported.
-        """
-        # This is a placeholder - actual implementation depends on ONNX structure
-        # MobileSAM decoder typically needs:
-        # - image_embeddings
-        # - sparse_embeddings (from box/point prompts)
-        # - dense_embeddings (from image)
-        
-        # For now, return a dummy mask matching the box
-        # In production, this would call the actual decoder session
-        return np.ones((1024, 1024), dtype=np.float32)
-    
+        prompts = [list(map(float, box)) for box in boxes]
+        try:
+            return model.predict(
+                source=image,
+                bboxes=prompts,
+                device=ultralytics_device(self.device),
+                verbose=False,
+            )
+        except Exception as exc:
+            if not self._is_cuda() or not self._is_out_of_memory(exc):
+                raise
+            logger.warning(
+                "CUDA out of memory during MobileSAM; retrying on CPU: %s", exc
+            )
+            self._release_cuda(model)
+            self.device = DEVICE_CPU
+            return model.predict(
+                source=image, bboxes=prompts, device=DEVICE_CPU, verbose=False
+            )
+
+    @staticmethod
+    def _is_out_of_memory(exc: Exception) -> bool:
+        """Whether an exception is a CUDA out-of-memory error."""
+        if type(exc).__name__ in ("OutOfMemoryError", "CudaOutOfMemoryError"):
+            return True
+        return "out of memory" in str(exc).lower()
+
+    def _release_cuda(self, model):
+        """Move the model off the GPU and free its cached blocks."""
+        try:
+            model.model.to(DEVICE_CPU)
+        except Exception:
+            pass
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _scoreMask(result, count: int, min_score: float) -> List[bool]:
+        """Return a keep-flag per mask, filtered by confidence when available."""
+        if min_score <= 0 or count == 0:
+            return [True] * count
+        boxes = getattr(result, "boxes", None)
+        if boxes is None or getattr(boxes, "conf", None) is None:
+            return [True] * count
+        try:
+            scores = boxes.conf.cpu().numpy().tolist()
+        except (AttributeError, RuntimeError):
+            return [True] * count
+        if len(scores) != count:
+            return [True] * count
+        return [float(score) >= min_score for score in scores]
+
     def segment(
         self,
         image_path: str,
         boxes: List[List[float]],
-        progress_callback: Optional[Callable[[int, str], None]] = None
+        progress_callback: ProgressCallback = None,
+        min_score: float = 0.0,
     ) -> List[np.ndarray]:
-        """
-        Segment image from file using boxes.
-        
-        Args:
-            image_path: Path to image file
-            boxes: List of [x1, y1, x2, y2] in image coordinates
-            progress_callback: Optional progress callback
-            
-        Returns:
-            List of binary masks
-        """
-        # Load image
-        image = cv2.imread(image_path)
+        """Segment an image file from box prompts."""
+        image = cv2.imread(str(image_path))
         if image is None:
             raise ValueError(f"Failed to load image: {image_path}")
-        
-        return self.segment_from_boxes(image, boxes, progress_callback=progress_callback)
-    
+        return self.segment_from_boxes(
+            image, boxes, progress_callback, min_score=min_score
+        )
+
+    def segment_polygons(
+        self,
+        image_path: str,
+        boxes: List[List[float]],
+        progress_callback: ProgressCallback = None,
+        min_score: float = 0.0,
+    ) -> List[List[List[float]]]:
+        """Segment an image file and return one polygon per box.
+
+        Boxes whose mask has no usable contour are skipped, so the result may
+        be shorter than ``boxes``.
+        """
+        masks = self.segment(
+            image_path, boxes, progress_callback, min_score=min_score
+        )
+        polygons = []
+        for mask in masks:
+            polygon = mask_to_polygon(mask)
+            if polygon:
+                polygons.append(polygon)
+        return polygons
+
+    def segment_labeled(
+        self,
+        image_path: str,
+        boxes: List[List[float]],
+        labels: List[str],
+        progress_callback: ProgressCallback = None,
+        min_score: float = 0.0,
+    ) -> List[Tuple[int, str, List[List[float]]]]:
+        """Segment boxes and pair each mask with its prompt.
+
+        Unlike :meth:`segment_polygons` this keeps the prompt order, so a mask
+        can be traced back to the box that produced it (the caller needs that
+        to drop the source box afterwards).
+
+        Returns:
+            ``(prompt_index, label, polygon)`` per usable mask. Boxes whose mask
+            has no drawable contour are omitted.
+        """
+        masks = self.segment(
+            image_path, boxes, progress_callback, min_score=min_score
+        )
+        results: List[Tuple[int, str, List[List[float]]]] = []
+        for index, mask in enumerate(masks):
+            polygon = mask_to_polygon(mask)
+            if not polygon:
+                continue
+            label = labels[index] if index < len(labels) else ''
+            results.append((index, label, polygon))
+        return results
+
     def batch_segment(
         self,
         image_paths: List[str],
         boxes_list: List[List[List[float]]],
-        progress_callback: Optional[Callable[[int, str], None]] = None
+        progress_callback: ProgressCallback = None,
     ) -> Dict[str, List[np.ndarray]]:
-        """
-        Segment multiple images.
-        
-        Args:
-            image_paths: List of image file paths
-            boxes_list: List of box lists for each image
-            progress_callback: Optional progress callback
-            
-        Returns:
-            Dict mapping image_path -> list of masks
-        """
-        results = {}
-        total = len(image_paths)
-        
-        for i, (img_path, boxes) in enumerate(zip(image_paths, boxes_list)):
-            if progress_callback:
-                progress_callback(
-                    int((i / total) * 100),
-                    f"Processing {i+1}/{total}: {os.path.basename(img_path)}"
-                )
-            
+        """Segment several images, keyed by path."""
+        results: Dict[str, List[np.ndarray]] = {}
+        total = max(len(image_paths), 1)
+
+        for i, (image_path, boxes) in enumerate(zip(image_paths, boxes_list)):
+            _report(
+                progress_callback,
+                int((i / total) * 100),
+                f"Processing {i + 1}/{total}: {os.path.basename(image_path)}",
+            )
             try:
-                masks = self.segment(img_path, boxes)
-                results[img_path] = masks
-            except Exception as e:
-                print(f"Error segmenting {img_path}: {e}")
-                results[img_path] = []
-        
-        if progress_callback:
-            progress_callback(100, f"Completed {total} images")
-        
+                results[image_path] = self.segment(image_path, boxes)
+            except Exception as exc:
+                print(f"Error segmenting {image_path}: {exc}")
+                results[image_path] = []
+
+        _report(progress_callback, 100, f"Completed {total} image(s)")
         return results

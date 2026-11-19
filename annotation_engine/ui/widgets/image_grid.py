@@ -12,16 +12,17 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import (
     Qt, Signal, Slot, QSize, QRect, QModelIndex, QSortFilterProxyModel,
-    QAbstractListModel, QMimeData
+    QAbstractListModel, QMimeData, QPoint
 )
 from PySide6.QtGui import (
     QPixmap, QImage, QPainter, QColor, QFont, QIcon, QCursor,
-    QStandardItemModel, QStandardItem, QAction
+    QStandardItemModel, QStandardItem, QAction, QPen, QPolygon
 )
 from PySide6.QtWidgets import QStyle
 
 from annotation_engine.config import SUPPORTED_IMAGE_FORMATS, COLORS, ICONS_DIR
 from annotation_engine.core.database import get_project
+from annotation_engine.ui.colors import resolve_label_color
 
 
 class ImageGridModel(QAbstractListModel):
@@ -30,8 +31,14 @@ class ImageGridModel(QAbstractListModel):
     def __init__(self, images: List[Dict] = None, parent=None):
         super().__init__(parent)
         self.images = images or []
-        self.thumbnails = {}  # Cache for thumbnails
+        self.thumbnails = {}  # Cache for base thumbnails (no overlays)
+        self.overlays = {}    # Cache for overlay-composited thumbnails
         self.thumbnail_size = QSize(180, 180)
+        # Label overlay state, fed by the main window.
+        self.annotations: Dict[int, List[dict]] = {}
+        self.label_colors: Dict[str, str] = {}
+        self.label_visibility: Dict[str, bool] = {}
+        self.show_overlays: bool = True
     
     def rowCount(self, parent=QModelIndex()) -> int:
         return len(self.images)
@@ -47,6 +54,8 @@ class ImageGridModel(QAbstractListModel):
         
         elif role == Qt.DecorationRole:
             # Return the cached thumbnail pixmap directly (no QIcon wrapping).
+            if self.show_overlays:
+                return self.getOverlayThumbnail(image)
             return self.getThumbnail(image)
         
         elif role == Qt.ToolTipRole:
@@ -106,7 +115,181 @@ class ImageGridModel(QAbstractListModel):
         self.beginResetModel()
         self.images = images
         self.thumbnails.clear()
+        self.overlays.clear()
         self.endResetModel()
+
+    def setAnnotationData(
+        self,
+        annotations: Optional[Dict[int, List[dict]]] = None,
+        label_colors: Optional[Dict[str, str]] = None,
+        label_visibility: Optional[Dict[str, bool]] = None,
+    ):
+        """Feed annotation shapes and label metadata for overlay rendering."""
+        if annotations is not None:
+            self.annotations = annotations
+        if label_colors is not None:
+            self.label_colors = label_colors
+        if label_visibility is not None:
+            self.label_visibility = label_visibility
+        self.overlays.clear()
+
+    def setShowOverlays(self, show: bool):
+        """Toggle label overlays on/off and refresh the view."""
+        if show == self.show_overlays:
+            return
+        self.show_overlays = show
+        self.layoutChanged.emit()
+
+    def invalidateOverlay(self, image_id: int):
+        """Drop a single image's cached overlay so it is recomposed next paint."""
+        self.overlays.pop(image_id, None)
+
+    def getThumbnail(self, image: Dict) -> Optional[QPixmap]:
+        """Get or create the base (unannotated) thumbnail for an image."""
+        image_id = image['id']
+        if image_id in self.thumbnails:
+            return self.thumbnails[image_id]
+        
+        # Generate thumbnail path
+        project = get_project(image['project_id']) if 'project_id' in image else None
+        if project:
+            image_path = os.path.join(project['base_path'], image['relative_path'])
+        else:
+            return None
+        
+        if os.path.exists(image_path):
+            pixmap = QPixmap(image_path)
+            if not pixmap.isNull():
+                thumb = pixmap.scaled(
+                    self.thumbnail_size, 
+                    Qt.KeepAspectRatio, 
+                    Qt.SmoothTransformation
+                )
+                self.thumbnails[image_id] = thumb
+                return thumb
+        
+        return None
+
+    def getOverlayThumbnail(self, image: Dict) -> Optional[QPixmap]:
+        """Return the thumbnail with saved annotation shapes drawn on top."""
+        image_id = image['id']
+        if image_id in self.overlays:
+            return self.overlays[image_id]
+
+        base = self.getThumbnail(image)
+        if base is None:
+            return None
+
+        shapes = self.annotations.get(image_id) or []
+        composed = self._composeOverlay(base, shapes, image)
+        self.overlays[image_id] = composed
+        return composed
+
+    def _composeOverlay(self, base: QPixmap, shapes: List[dict], image: Dict) -> QPixmap:
+        """Paint annotation shapes onto a copy of the base thumbnail."""
+        if not shapes:
+            return base
+
+        composed = QPixmap(base)
+        painter = QPainter(composed)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        img_w = image.get('width') or 1
+        img_h = image.get('height') or 1
+        sx = base.width() / img_w
+        sy = base.height() / img_h
+
+        for shape in shapes:
+            label = shape.get('label') or ''
+            if label and self.label_visibility.get(label) is False:
+                continue
+            color = resolve_label_color(label, self.label_colors)
+
+            shape_type = shape.get('shape_type') or 'polygon'
+            points = shape.get('points') or []
+            pts = [
+                QPoint(int(p[0] * sx), int(p[1] * sy))
+                for p in points
+                if len(p) >= 2
+            ]
+            if not pts:
+                continue
+
+            if shape_type == 'mask':
+                self._paintMaskShape(painter, color, shape, img_w, img_h, sx, sy)
+                continue
+
+            fill = QColor(color)
+            fill.setAlpha(60)
+            pen = QPen(QColor(color))
+            pen.setWidth(max(1, round(1.5 * sx)))
+            painter.setPen(pen)
+
+            if shape_type == 'point':
+                painter.setBrush(QColor(color))
+                painter.drawEllipse(pts[0], 2, 2)
+            elif shape_type == 'line':
+                painter.setBrush(Qt.NoBrush)
+                painter.drawLine(pts[0], pts[-1])
+            elif shape_type in ('linestrip', 'polyline'):
+                painter.setBrush(Qt.NoBrush)
+                painter.drawPolyline(pts)
+            elif shape_type == 'circle' and len(pts) >= 2:
+                painter.setBrush(fill)
+                center = pts[0]
+                radius = int(((pts[1].x() - center.x()) ** 2 +
+                              (pts[1].y() - center.y()) ** 2) ** 0.5)
+                painter.drawEllipse(center, radius, radius)
+            elif shape_type == 'rectangle' and len(pts) >= 2:
+                # LabelMe stores a rectangle as two corner points; expand them
+                # into a real box (normalized in case the corners are inverted).
+                painter.setBrush(fill)
+                painter.drawRect(QRect(pts[0], pts[1]).normalized())
+            else:
+                # polygon, rectangle, oriented_rectangle
+                painter.setBrush(fill)
+                painter.drawPolygon(QPolygon(pts))
+
+        painter.end()
+        return composed
+
+    def _paintMaskShape(self, painter: QPainter, color: QColor, shape: dict,
+                        img_w: int, img_h: int, sx: float, sy: float):
+        """Draw a mask shape, falling back to its bounding box outline."""
+        mask = shape.get('mask')
+        if mask:
+            fill = QColor(color)
+            fill.setAlpha(70)
+            pen = QPen(QColor(color))
+            pen.setWidth(1)
+            painter.setPen(pen)
+            painter.setBrush(fill)
+            for rect in mask:
+                # rect = [x0, y0, x1, y1] in image coords
+                if len(rect) < 4:
+                    continue
+                x0, y0, x1, y1 = rect[:4]
+                painter.drawRect(
+                    QRect(int(x0 * sx), int(y0 * sy),
+                          int((x1 - x0) * sx) + 1, int((y1 - y0) * sy) + 1)
+                )
+        else:
+            points = shape.get('points') or []
+            if not points:
+                return
+            xs = [p[0] for p in points if len(p) >= 2]
+            ys = [p[1] for p in points if len(p) >= 2]
+            if not xs:
+                return
+            pen = QPen(QColor(color))
+            pen.setWidth(1)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(
+                QRect(int(min(xs) * sx), int(min(ys) * sy),
+                      int((max(xs) - min(xs)) * sx) + 1,
+                      int((max(ys) - min(ys)) * sy) + 1)
+            )
     
     def getImage(self, row: int) -> Optional[Dict]:
         """Get image data by row."""
@@ -351,6 +534,14 @@ class ImageGridWidget(QWidget):
         self.split_filter.currentTextChanged.connect(self.filterImages)
         filter_layout.addWidget(self.split_filter)
         
+        self.overlay_check = QPushButton()
+        self.overlay_check.setCheckable(True)
+        self.overlay_check.setChecked(True)
+        self.overlay_check.setToolTip("Show Labels")
+        self.overlay_check.setText("Show Labels")
+        self.overlay_check.toggled.connect(self._onOverlayToggled)
+        filter_layout.addWidget(self.overlay_check)
+        
         layout.addLayout(filter_layout)
         
         # Image list view
@@ -387,6 +578,27 @@ class ImageGridWidget(QWidget):
         """Set images to display."""
         self.model.setImages(images)
         self.project_id = images[0]['project_id'] if images else None
+
+    def setAnnotationData(
+        self,
+        annotations: Optional[Dict[int, List[dict]]] = None,
+        label_colors: Optional[Dict[str, str]] = None,
+        label_visibility: Optional[Dict[str, bool]] = None,
+    ):
+        """Feed annotation shapes and label metadata into the grid model."""
+        self.model.setAnnotationData(
+            annotations=annotations,
+            label_colors=label_colors,
+            label_visibility=label_visibility,
+        )
+
+    def _onOverlayToggled(self, checked: bool):
+        self.model.setShowOverlays(checked)
+
+    def invalidateOverlay(self, image_id: int):
+        """Refresh a single image's overlay (e.g. after saving its annotation)."""
+        self.model.invalidateOverlay(image_id)
+        self.list_view.viewport().update()
     
     def clear(self):
         """Clear all images."""
