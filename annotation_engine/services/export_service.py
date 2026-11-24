@@ -29,7 +29,8 @@ class ExportService:
         self.images = get_project_images(project_id)
         self.image_map = {img['id']: img for img in self.images}
     
-    def _get_category_mapping(self, include_polygons: bool, include_keypoints: bool) -> Dict:
+    def _get_category_mapping(self, include_polygons: bool, include_keypoints: bool,
+                              include_obb: bool) -> Dict:
         """Build category mapping from all annotations."""
         categories = {}
         cat_id = 0
@@ -47,6 +48,8 @@ class ExportService:
                 include = False
                 if shape_type == 'rectangle' and True:  # bboxes always included
                     include = True
+                elif shape_type == 'oriented_rectangle' and include_obb:
+                    include = True
                 elif shape_type == 'polygon' and include_polygons:
                     include = True
                 elif shape_type == 'point' and include_keypoints:
@@ -58,11 +61,67 @@ class ExportService:
         
         return categories
     
+    def _assignSplits(
+        self, split_distribution: Optional[Dict[str, float]] = None
+    ) -> Dict[int, str]:
+        """Map each image id to a split for a grouped export.
+
+        Images that already carry a ``train``/``val``/``test`` split keep it.
+        Images without one are distributed by the relative weights of
+        ``split_distribution`` (normalized; a zero test weight yields no test
+        split). The assignment is deterministic because ``self.images`` is
+        already ordered by import time.
+        """
+        assigned: Dict[int, str] = {}
+        unassigned = []
+        for image in self.images:
+            split = image.get('split')
+            if split in ('train', 'val', 'test'):
+                assigned[image['id']] = split
+            else:
+                unassigned.append(image)
+
+        if not unassigned:
+            return assigned
+
+        distribution = split_distribution or {}
+        weights = {
+            'train': float(distribution.get('train', 0.7) or 0),
+            'val': float(distribution.get('val', 0.2) or 0),
+            'test': float(distribution.get('test', 0.1) or 0),
+        }
+        total = sum(weights.values())
+        if total <= 0:
+            total = 1.0
+            weights['train'] = 1.0
+
+        # Cumulative thresholds; a split with zero weight shares its threshold
+        # with the previous one, so it naturally receives no images.
+        thresholds: Dict[str, float] = {}
+        running = 0.0
+        for split in ('train', 'val', 'test'):
+            running += weights[split] / total
+            thresholds[split] = running
+
+        n = len(unassigned)
+        for i, image in enumerate(unassigned):
+            pos = (i + 0.5) / n
+            if pos < thresholds['train']:
+                assigned[image['id']] = 'train'
+            elif pos < thresholds['val']:
+                assigned[image['id']] = 'val'
+            else:
+                assigned[image['id']] = 'test'
+
+        return assigned
+    
     def export_yolo(
         self,
         output_dir: Path,
-        split_ratios: Dict[str, float],
+        use_split: bool = True,
+        split_distribution: Optional[Dict[str, float]] = None,
         include_bboxes: bool = True,
+        include_obb: bool = True,
         include_polygons: bool = True,
         include_keypoints: bool = True,
         progress_callback: Optional[callable] = None
@@ -72,31 +131,53 @@ class ExportService:
         
         YOLO format: one .txt file per image with lines:
         class_id x_center y_center width height [keypoint_x keypoint_y visibility ...]
+        
+        With ``use_split`` the images/labels are grouped into train/val/test
+        subfolders and a ``data.yaml`` is written; otherwise the layout is flat
+        (``images/`` and ``labels/``) and no ``data.yaml`` is generated.
+
+        ``split_distribution`` (train/val/test relative weights) assigns images
+        that were imported without a split; images that already carry a split
+        keep it. A zero test weight means no test split is produced.
         """
         try:
             output_dir = Path(output_dir)
             output_dir.mkdir(parents=True, exist_ok=True)
             
-            # Create split directories
-            for split in ['train', 'val', 'test']:
-                (output_dir / 'images' / split).mkdir(parents=True, exist_ok=True)
-                (output_dir / 'labels' / split).mkdir(parents=True, exist_ok=True)
+            images_root = output_dir / 'images'
+            labels_root = output_dir / 'labels'
+            
+            # Precompute each image's split (only meaningful when grouping).
+            split_by_id: Dict[int, str] = {}
+            if use_split:
+                split_by_id = self._assignSplits(split_distribution)
+                used_splits = sorted(set(split_by_id.values()))
+                for split in used_splits:
+                    (images_root / split).mkdir(parents=True, exist_ok=True)
+                    (labels_root / split).mkdir(parents=True, exist_ok=True)
+            else:
+                images_root.mkdir(parents=True, exist_ok=True)
+                labels_root.mkdir(parents=True, exist_ok=True)
             
             # Get category mapping
-            categories = self._get_category_mapping(True, True)
+            categories = self._get_category_mapping(
+                include_polygons, include_keypoints, include_obb
+            )
             
-            # Write data.yaml
-            data_yaml = {
-                'path': str(output_dir.absolute()),
-                'train': 'images/train',
-                'val': 'images/val',
-                'test': 'images/test',
-                'nc': len(categories),
-                'names': [name for name, _ in sorted(categories.items(), key=lambda x: x[1])]
-            }
-            
-            with open(output_dir / 'data.yaml', 'w') as f:
-                yaml.dump(data_yaml, f, default_flow_style=False)
+            # Write data.yaml (only when grouping by split), listing only the
+            # splits that actually receive images.
+            if use_split:
+                data_yaml = {'path': str(output_dir.absolute())}
+                for split in ('train', 'val', 'test'):
+                    if split in split_by_id.values():
+                        data_yaml[split] = f'images/{split}'
+                data_yaml['nc'] = len(categories)
+                data_yaml['names'] = [
+                    name for name, _ in sorted(categories.items(), key=lambda x: x[1])
+                ]
+                
+                with open(output_dir / 'data.yaml', 'w') as f:
+                    yaml.dump(data_yaml, f, default_flow_style=False)
             
             # Process images
             total = len(self.images)
@@ -107,14 +188,18 @@ class ExportService:
                         f"Exporting {image['filename']}"
                     )
                 
-                # Determine split
-                split = image.get('split', 'train')
-                if split not in ['train', 'val', 'test']:
-                    split = 'train'
+                # Determine destination folders
+                if use_split:
+                    split = split_by_id.get(image['id'], 'train')
+                    img_dst_dir = images_root / split
+                    lbl_dst_dir = labels_root / split
+                else:
+                    img_dst_dir = images_root
+                    lbl_dst_dir = labels_root
                 
                 # Copy image
                 src = self.base_path / image['relative_path']
-                dst = output_dir / 'images' / split / image['filename']
+                dst = img_dst_dir / image['filename']
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
                 
@@ -122,7 +207,7 @@ class ExportService:
                 annotation = get_annotation(image['id'])
                 if not annotation:
                     # Create empty label file
-                    label_file = output_dir / 'labels' / split / f"{Path(image['filename']).stem}.txt"
+                    label_file = lbl_dst_dir / f"{Path(image['filename']).stem}.txt"
                     label_file.touch()
                     continue
                 
@@ -151,6 +236,15 @@ class ExportService:
                         height = abs(y2 - y1) / img_height
                         
                         yolo_lines.append(f"{cat_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}")
+                    
+                    elif shape_type == 'oriented_rectangle' and len(points) >= 4:
+                        # Oriented bounding box: class_id + 4 normalized corners.
+                        if include_obb:
+                            corners = []
+                            for x, y in points[:4]:
+                                corners.append(f"{x / img_width:.6f}")
+                                corners.append(f"{y / img_height:.6f}")
+                            yolo_lines.append(f"{cat_id} " + " ".join(corners))
                     
                     elif shape_type == 'polygon' and len(points) >= 3:
                         # Polygon (YOLO seg format)
@@ -182,7 +276,7 @@ class ExportService:
                             )
                 
                 # Write label file
-                label_file = output_dir / 'labels' / split / f"{Path(image['filename']).stem}.txt"
+                label_file = lbl_dst_dir / f"{Path(image['filename']).stem}.txt"
                 with open(label_file, 'w') as f:
                     f.write('\n'.join(yolo_lines))
             
@@ -261,8 +355,9 @@ class ExportService:
     def export_both(
         self,
         output_dir: Path,
-        split_ratios: Dict[str, float],
+        use_split: bool = True,
         include_bboxes: bool = True,
+        include_obb: bool = True,
         include_polygons: bool = True,
         include_keypoints: bool = True,
         progress_callback: Optional[callable] = None
@@ -283,8 +378,9 @@ class ExportService:
                     progress_callback(p // 2, f"YOLO: {msg}")
             
             yolo_success = self.export_yolo(
-                yolo_dir, split_ratios, include_bboxes, include_polygons, include_keypoints,
-                yolo_progress
+                yolo_dir, use_split=use_split, include_bboxes=include_bboxes,
+                include_obb=include_obb, include_polygons=include_polygons,
+                include_keypoints=include_keypoints, progress_callback=yolo_progress,
             )
             
             if progress_callback:

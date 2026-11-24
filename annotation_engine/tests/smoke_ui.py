@@ -188,6 +188,97 @@ check("resolve_label_color falls back to palette",
       resolve_label_color("zzz_unknown", {}).isValid())
 
 
+# ----------------------------------------------------- annotation filters
+from annotation_engine.ui.widgets.image_grid import (
+    ImageFilterProxyModel, ImageGridModel,
+)
+
+fimages = [
+    {"id": 1, "project_id": 1, "filename": "a.jpg",
+     "relative_path": "images/a.jpg", "split": "train"},
+    {"id": 2, "project_id": 1, "filename": "b.jpg",
+     "relative_path": "images/b.jpg", "split": "train"},
+    {"id": 3, "project_id": 1, "filename": "c.jpg",
+     "relative_path": "images/c.jpg", "split": "train"},
+    {"id": 4, "project_id": 1, "filename": "d.jpg",
+     "relative_path": "images/d.jpg", "split": "train"},
+]
+fmodel = ImageGridModel(fimages)
+fmodel.setAnnotationData(annotations={
+    1: [{"label": "box"}, {"label": "box"}],      # duplicate 'box'
+    2: [{"label": "car"}],                         # has 'car'
+    3: [],                                         # none
+    4: [{"label": "box"}, {"label": "person"}],    # has box + person
+})
+check("annotationState none", fmodel.annotationState(3) == "none")
+check("annotationState has", fmodel.annotationState(2) == "has")
+check("annotationState duplicate", fmodel.annotationState(1) == "duplicate")
+check("labelCounts for duplicate image",
+      fmodel.labelCounts(1) == {"box": 2}, fmodel.labelCounts(1))
+
+fproxy = ImageFilterProxyModel()
+fproxy.setSourceModel(fmodel)
+
+fproxy.setAnnotationFilter("none")
+check("filter: no labels keeps only empty images", fproxy.rowCount() == 1)
+fproxy.setAnnotationFilter("has")
+check("filter: has labels excludes empty images", fproxy.rowCount() == 3)
+fproxy.setAnnotationFilter("duplicate")
+check("filter: duplicate labels keeps only dup images", fproxy.rowCount() == 1)
+
+fproxy.setAnnotationFilter("has")
+fproxy.setLabelFilter("box")
+check("filter: has label 'box'", fproxy.rowCount() == 2, fproxy.rowCount())
+fproxy.setAnnotationFilter("duplicate")
+check("filter: duplicate label 'box'", fproxy.rowCount() == 1, fproxy.rowCount())
+fproxy.setAnnotationFilter("all")
+fproxy.setLabelFilter(None)
+check("filter: all restores everything", fproxy.rowCount() == 4)
+
+# Widget-level wiring: combos drive the proxy, label combo is populated + gated.
+fw = ImageGridWidget()
+fw.setImages(fimages)
+fw.setAnnotationData(
+    annotations={1: [{"label": "box"}, {"label": "box"}],
+                 2: [{"label": "car"}]},
+    label_colors={"box": "#ff0000", "car": "#00ff00", "person": "#0000ff"},
+    label_visibility={"box": True, "car": True, "person": True},
+)
+fw.show()
+app.processEvents()
+check("label filter lists project labels",
+      [fw.label_filter.itemData(i) for i in range(fw.label_filter.count())]
+      == [None, "box", "car", "person"],
+      [fw.label_filter.itemData(i) for i in range(fw.label_filter.count())])
+fw.annotation_filter.setCurrentIndex(fw.annotation_filter.findData("duplicate"))
+check("duplicate filter enabled label combo", fw.label_filter.isEnabled())
+check("widget duplicate filter matches", fw.proxy_model.rowCount() == 1)
+fw.annotation_filter.setCurrentIndex(fw.annotation_filter.findData("none"))
+check("none filter disables label combo", not fw.label_filter.isEnabled())
+
+# Grid selection must survive filter toggles (arrow-key navigation context).
+def grid_current_image_id(widget):
+    idx = widget.list_view.currentIndex()
+    if idx.row() < 0:
+        return None
+    source = widget.proxy_model.mapToSource(idx)
+    image = widget.model.getImage(source.row())
+    return image['id'] if image else None
+
+fw.annotation_filter.setCurrentIndex(fw.annotation_filter.findData("all"))
+app.processEvents()
+fw.revealImage(2)
+app.processEvents()
+check("grid selects the revealed image", grid_current_image_id(fw) == 2,
+      grid_current_image_id(fw))
+fw.annotation_filter.setCurrentIndex(fw.annotation_filter.findData("none"))
+app.processEvents()
+fw.annotation_filter.setCurrentIndex(fw.annotation_filter.findData("all"))
+app.processEvents()
+check("selection restored after switching filter back",
+      grid_current_image_id(fw) == 2, grid_current_image_id(fw))
+
+
 # --------------------------------------------------------------- title bar
 import annotation_engine.ui.main_window as mw
 mw.MainWindow.showWelcomeDialog = lambda self: None
@@ -221,7 +312,7 @@ window.label_list.addLabel("car")
 window.canvas.shapes = []
 window.syncLabelsFromShapes()
 car_widget = window.label_list.list_widget.itemWidget(
-    window.label_list.list_widget.item(0)
+    window.label_list.list_widget.topLevelItem(0), 0
 )
 check("label dimmed when absent", car_widget._opacity.opacity() < 1.0,
       car_widget._opacity.opacity())

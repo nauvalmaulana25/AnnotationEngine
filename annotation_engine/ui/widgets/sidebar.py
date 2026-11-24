@@ -70,3 +70,15 @@ class SidebarWidget(QWidget):
     def setSelectedIndices(self, indices: List[int]):
         """Set selected indices."""
         self.image_grid.setSelectedIndices(indices)
+
+    def visibleImageIds(self) -> List[int]:
+        """Image ids in display order, honouring the active filter."""
+        return self.image_grid.visibleImageIds()
+
+    def revealImage(self, image_id: int):
+        """Select an image and scroll it into view."""
+        self.image_grid.revealImage(image_id)
+
+    def setLastSeen(self, image_id: int):
+        """Mark which image the project reopens on."""
+        self.image_grid.setLastSeen(image_id)

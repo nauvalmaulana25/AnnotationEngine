@@ -2,15 +2,20 @@
 AnnotationEngine Desktop - Main Window (Simplified Working Version)
 """
 import os
+import logging
 from pathlib import Path
 from typing import Optional, List
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QSplitter, QDockWidget, QToolBar,
     QStatusBar, QMenuBar, QMenu, QFileDialog, QMessageBox,
-    QVBoxLayout, QLabel, QProgressBar, QDialog, QScrollArea, QFrame
+    QVBoxLayout, QLabel, QProgressBar, QDialog, QScrollArea, QFrame,
+    QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QComboBox,
+    QAbstractItemView
 )
-from PySide6.QtCore import Qt, QSettings, QSize, Signal, Slot, QThread, QTimer
+from PySide6.QtCore import (
+    Qt, QSettings, QSize, Signal, Slot, QThread, QTimer, QObject, QEvent
+)
 from PySide6.QtGui import QAction, QIcon, QKeySequence
 
 from annotation_engine.config import (
@@ -23,7 +28,7 @@ from annotation_engine.core.database import (
     update_image, save_annotation, get_annotation, get_setting, set_setting,
     add_recent_project, get_recent_projects, clean_database,
     get_project_labels, save_project_labels, rename_label_in_project,
-    label_in_use, get_project_annotations
+    label_in_use, get_project_annotations, get_last_image_id, set_last_image_id
 )
 from annotation_engine.ui.styles import get_application_stylesheet
 from annotation_engine.ui.widgets.image_grid import ImageGridWidget
@@ -46,6 +51,12 @@ from annotation_engine.utils.encryption import EncryptionManager
 from annotation_engine.utils.file_ops import build_labelme_payload, write_labelme_json
 from annotation_engine.services.job_queue import JobQueue
 from annotation_engine.services.mobile_sam import MobileSAMService
+from annotation_engine.services.yolo_service import YOLOService
+from annotation_engine.services.grounding_dino import (
+    GroundingDINOSync,
+    LocalGroundingDINOService,
+    grounding_dino_mode,
+)
 from annotation_engine.services.model_manager import (
     ModelDownloadError,
     download_mobile_sam,
@@ -54,6 +65,8 @@ from annotation_engine.services.model_manager import (
 
 # Project root for resources
 PROJECT_ROOT = Path(__file__).parent.parent.parent
+
+logger = logging.getLogger(__name__)
 
 
 class MainWindow(QMainWindow):
@@ -81,8 +94,16 @@ class MainWindow(QMainWindow):
         self._suspend_autosave: bool = False
         self._mobile_sam: Optional[MobileSAMService] = None
         self._mobile_sam_job: Optional[str] = None
+        self._yolo_services: dict = {}
+        self._yolo_job: Optional[str] = None
+        self._local_grounding_dino: dict = {}
+        self._grounding_dino_job: Optional[str] = None
+        self._grounding_dino_mode: Optional[str] = None
         self._auto_annotate_dialog: Optional[AutoAnnotateDialog] = None
         self._managed_jobs: dict = {}
+        self._auto_annotate_warmed: bool = False
+        self._prewarm_thread: Optional[QThread] = None
+        self._prewarm_worker = None
         
         # Autosave: every edit (including undo/redo) persists shortly after it
         # settles. A single-shot timer coalesces bursts, e.g. a delete that
@@ -219,6 +240,10 @@ class MainWindow(QMainWindow):
         self.canvas.historyChanged.connect(self.toolbar.setUndoRedoEnabled)
         self.canvas.setLabelProvider(lambda: list(self.label_list.labels.keys()))
         self.canvas.shapesChanged.connect(self.onCanvasShapesChanged)
+        # Arrow keys switch images unless a widget needs them or the canvas has
+        # a selection to nudge. Application level, because Qt only delivers
+        # keys to the focused widget and the canvas starts unfocused.
+        QApplication.instance().installEventFilter(self)
         if hasattr(self.canvas, "mouse_moved"):
             self.canvas.mouse_moved.connect(self.onCanvasMouseMoved)
         if hasattr(self.canvas, "status_updated"):
@@ -235,6 +260,8 @@ class MainWindow(QMainWindow):
         self.label_list.removeLabelRequested.connect(self.onLabelRemove)
         self.label_list.renameLabelRequested.connect(self.onLabelRename)
         self.label_list.labelsChanged.connect(self._saveProjectLabels)
+        self.label_list.instanceClicked.connect(self.onInstanceClicked)
+        self.label_list.instanceDeleteRequested.connect(self.onInstanceDelete)
         self.canvas.setLabelColors(self.label_list.getLabelColors())
         
         # Job queue signals
@@ -344,11 +371,14 @@ class MainWindow(QMainWindow):
         # Tools menu
         tools_menu = menubar.addMenu("&Tools")
         
-        for tool_name, shortcut in [
-            ("select", "V"), ("bbox", "B"), ("polygon", "P"),
-            ("keypoint", "K")
+        for tool_name, label, shortcut in [
+            ("select", "Select", "V"),
+            ("bbox", "Bounding Box", "B"),
+            ("polygon", "Polygon", "P"),
+            ("keypoint", "Keypoint", "K"),
+            ("obb", "Oriented Box", "O"),
         ]:
-            action = QAction(tool_name.capitalize(), self)
+            action = QAction(label, self)
             action.setShortcut(QKeySequence(shortcut))
             action.setCheckable(True)
             action.setData(tool_name)
@@ -379,6 +409,22 @@ class MainWindow(QMainWindow):
         toggle_labels.setChecked(True)
         toggle_labels.toggled.connect(self.toggleLabelsPanel)
         view_menu.addAction(toggle_labels)
+        
+        view_menu.addSeparator()
+        
+        # Explicit navigation shortcuts: these work even with a shape selected,
+        # where the plain arrow keys nudge instead.
+        prev_image = QAction("&Previous Image", self)
+        prev_image.setShortcut(QKeySequence("Alt+Left"))
+        prev_image.setStatusTip("Open the previous image")
+        prev_image.triggered.connect(lambda: self.navigateImage(-1))
+        view_menu.addAction(prev_image)
+        
+        next_image = QAction("&Next Image", self)
+        next_image.setShortcut(QKeySequence("Alt+Right"))
+        next_image.setStatusTip("Open the next image")
+        next_image.triggered.connect(lambda: self.navigateImage(1))
+        view_menu.addAction(next_image)
         
         view_menu.addSeparator()
         
@@ -517,6 +563,67 @@ class MainWindow(QMainWindow):
         self.status_bar.setProject(project)
         
         self.projectLoaded.emit(project_id)
+        
+        # Reopen the image this project was last left on.
+        self._restoreLastImage(images)
+        
+        # Warm the auto-annotate device list off the UI thread: enumerating
+        # devices imports torch (~1.2s), and the dialog should open instantly.
+        self._prewarmAutoAnnotate()
+    
+    def _restoreLastImage(self, images: List[dict]):
+        """Reopen the project's last viewed image, if it still exists."""
+        if not images or not self.current_project_id:
+            return
+        last_id = get_last_image_id(self.current_project_id)
+        known = {image['id'] for image in images}
+        if last_id is not None and last_id in known:
+            self.sidebar.setLastSeen(last_id)
+            self.loadImage(last_id)
+        else:
+            # A stale id (deleted image) is ignored; the next load overwrites it.
+            self.sidebar.setLastSeen(None)
+    
+    def _prewarmAutoAnnotate(self):
+        """Prepare auto-annotate dependencies in the background.
+
+        Runs once per session, with no dialogs or progress UI: the only cost
+        paid is a background thread that finishes before the user opens the
+        Auto Annotate menu.
+        """
+        if self._auto_annotate_warmed or self._prewarm_thread is not None:
+            return
+        self._auto_annotate_warmed = True
+        
+        from annotation_engine.services.device import prewarm_devices
+        
+        class _WarmWorker(QObject):
+            finished = Signal()
+            
+            @Slot()
+            def run(self):
+                try:
+                    prewarm_devices()
+                except Exception as exc:  # never let warm-up break the app
+                    logger.warning("Auto-annotate warm-up failed: %s", exc)
+                finally:
+                    self.finished.emit()
+        
+        thread = QThread(self)
+        worker = _WarmWorker()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._onPrewarmFinished)
+        self._prewarm_thread = thread
+        self._prewarm_worker = worker
+        thread.start()
+    
+    def _onPrewarmFinished(self):
+        self._prewarm_thread = None
+        self._prewarm_worker = None
     
     def closeProject(self):
         """Close current project."""
@@ -668,6 +775,14 @@ class MainWindow(QMainWindow):
             self.imageSelected.emit(image_id)
             self.status_bar.setImage(image)
             self._updateWindowTitle(image_id)
+            # Remember where the user left off so reopening the project lands
+            # on the same image.
+            set_last_image_id(self.current_project_id, image_id)
+            self.sidebar.setLastSeen(image_id)
+            self.sidebar.revealImage(image_id)
+            # Focus the canvas so drawing and arrow-key nudging work straight
+            # away, without needing a click on the image first.
+            self.canvas.setFocus(Qt.FocusReason.OtherFocusReason)
         else:
             QMessageBox.warning(self, "Error", "Failed to load image.")
 
@@ -782,6 +897,82 @@ class MainWindow(QMainWindow):
     def onCanvasMouseMoved(self, pos):
         self.status_bar.setCoordinates(pos.x(), pos.y())
 
+    # ------------------------------------------------------------------
+    # Image navigation
+    # ------------------------------------------------------------------
+    def eventFilter(self, obj, event):
+        """Let Left/Right switch images when nothing is selected.
+
+        Installed on the QApplication rather than the canvas: Qt only delivers
+        key events to the focused widget, and the canvas is not focused until
+        the user clicks it. Filtering at application level keeps navigation
+        working wherever focus happens to be, while the guards below leave the
+        keys alone in widgets that need them.
+        """
+        if event.type() == QEvent.Type.KeyPress:
+            if event.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right):
+                if event.modifiers() not in (
+                    Qt.KeyboardModifier.NoModifier,
+                    Qt.KeyboardModifier.KeypadModifier,
+                ):
+                    return super().eventFilter(obj, event)
+                # Check the focused widget, not `obj`: an unhandled key
+                # propagates up the parent chain, so `obj` can be an ancestor
+                # even though the key was pressed in a combo or text field.
+                target = QApplication.focusWidget() or obj
+                if self._widgetNeedsArrowKeys(target):
+                    return super().eventFilter(obj, event)
+                if QApplication.activeModalWidget() is not None:
+                    return super().eventFilter(obj, event)
+                if self._canvasAllowsArrowNavigation():
+                    step = -1 if event.key() == Qt.Key.Key_Left else 1
+                    self.navigateImage(step)
+                    return True
+        return super().eventFilter(obj, event)
+
+    def _widgetNeedsArrowKeys(self, widget) -> bool:
+        """Whether a focused widget uses the arrow keys itself.
+
+        Text entry needs them for the caret, spin boxes and combos to change
+        value, and item views to move their selection. The image grid is the
+        deliberate exception: arrowing through it should open the image.
+        """
+        if isinstance(
+            widget, (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QComboBox)
+        ):
+            return True
+        if isinstance(widget, QAbstractItemView):
+            grid_view = getattr(getattr(self, "sidebar", None), "image_grid", None)
+            return widget is not getattr(grid_view, "list_view", None)
+        return False
+
+    def _canvasAllowsArrowNavigation(self) -> bool:
+        """Whether arrow keys should switch images instead of nudging."""
+        if not self.current_project_id:
+            return False
+        if getattr(self.canvas, "is_drawing", False):
+            return False
+        selected = getattr(self.canvas, "selected_shapes", None) or []
+        return not selected
+
+    def navigateImage(self, step: int):
+        """Open the previous/next image in the grid's visible order."""
+        if not self.current_project_id or not step:
+            return
+        ids = self.sidebar.visibleImageIds()
+        if not ids:
+            return
+
+        if self.current_image_id in ids:
+            index = ids.index(self.current_image_id) + step
+        else:
+            # Nothing open yet: step opens the first (or last) image.
+            index = 0 if step > 0 else len(ids) - 1
+
+        if not 0 <= index < len(ids):
+            return
+        self.loadImage(ids[index])
+
     def onCanvasShapesChanged(self):
         """Refresh the UI after a canvas-initiated shape edit."""
         if self.current_image_id:
@@ -850,6 +1041,26 @@ class MainWindow(QMainWindow):
 
     def onLabelSelectShapes(self, label: str):
         self.canvas.selectShapesByLabel(label)
+
+    def onInstanceClicked(self, index: int):
+        """Select a single shape instance (a layer of a label) on the canvas."""
+        if not self.canvas or not (0 <= index < len(self.canvas.shapes)):
+            return
+        try:
+            self.canvas.select_shapes(shapes=[self.canvas.shapes[index]])
+        except (AttributeError, TypeError):
+            self.canvas.selected_shapes = [self.canvas.shapes[index]]
+        self.canvas.update()
+
+    def onInstanceDelete(self, index: int):
+        """Delete a single shape instance (a layer of a label)."""
+        if not self.canvas or not (0 <= index < len(self.canvas.shapes)):
+            return
+        try:
+            self.canvas.select_shapes(shapes=[self.canvas.shapes[index]])
+        except (AttributeError, TypeError):
+            self.canvas.selected_shapes = [self.canvas.shapes[index]]
+        self.canvas.deleteSelected()
 
     def onLabelDeleteShapes(self, label: str):
         if self.canvas.deleteShapesByLabel(label):
@@ -1008,6 +1219,9 @@ class MainWindow(QMainWindow):
         )
         dialog.runMobileSAM.connect(self.runMobileSam)
         dialog.downloadMobileSAM.connect(self.downloadMobileSamModel)
+        dialog.runYolo.connect(self.runYolo)
+        dialog.loadYoloModel.connect(self.loadYoloModel)
+        dialog.runGroundingDINO.connect(self.runGroundingDINO)
         self._auto_annotate_dialog = dialog
         try:
             dialog.exec()
@@ -1074,6 +1288,11 @@ class MainWindow(QMainWindow):
             return
 
         label = options.get('label')
+        labels = options.get('labels')
+        if labels is None:
+            # Older callers passed a single label (or the all-labels sentinel).
+            labels = [] if label in (None, '', '__all__') else [label]
+        labels = [name for name in labels if name]
         source = options.get('source') or 'existing'
         device = options.get('device') or 'auto'
         remove_boxes = bool(options.get('remove_boxes'))
@@ -1111,7 +1330,7 @@ class MainWindow(QMainWindow):
             shapes = annotation['data'].get('shapes', []) if annotation else []
             matched = [
                 (index, shape) for index, shape in enumerate(shapes)
-                if self._boxMatchesLabel(shape, label)
+                if self._boxMatchesLabels(shape, labels)
             ]
             prompts = []
             for _, shape in matched:
@@ -1136,17 +1355,20 @@ class MainWindow(QMainWindow):
         if not tasks:
             QMessageBox.information(
                 self, "MobileSAM",
-                "No boxes matched. Draw bounding boxes first, or pick "
-                "another label."
+                "No rectangles matched. Draw bounding boxes first, or tick "
+                "the labels you want to segment."
             )
             return
 
         min_score = float(options.get('iou_threshold') or 0.0)
-        fallback_label = None if label in (None, '', '__all__') else label
+        # A single ticked label names the output; otherwise each mask keeps the
+        # label of the box that prompted it.
+        fallback_label = labels[0] if len(labels) == 1 else None
 
         def worker(progress_callback=None):
             service = self.mobileSamService(device)
             results = {}
+            skipped_boxes = []
             total = len(tasks)
             for index, task in enumerate(tasks):
                 def report(percent, message, _i=index):
@@ -1155,22 +1377,32 @@ class MainWindow(QMainWindow):
 
                 # Each mask keeps the label of the box that prompted it, so an
                 # all-labels run still produces per-class shapes.
-                results[task['image_id']] = service.segment_labeled(
+                entries = service.segment_labeled(
                     task['image_path'],
                     [prompt['box'] for prompt in task['prompts']],
                     [prompt['label'] for prompt in task['prompts']],
                     report,
                     min_score=min_score,
                 )
+                results[task['image_id']] = entries
+                for missing in getattr(service, 'last_skipped_labels', []):
+                    skipped_boxes.append((task['image_id'], missing))
             return {
                 'results': results,
                 'label': fallback_label,
                 'tasks': tasks,
                 'device': service.device_description,
+                'skipped_boxes': skipped_boxes,
             }
 
         def on_done(result: dict):
             self._applyMobileSamResult(result, remove_boxes=remove_boxes)
+            for image_id, missing in result.get('skipped_boxes') or []:
+                logger.info(
+                    "MobileSAM skipped a box on image %s (label %r): "
+                    "no mask above the confidence floor",
+                    image_id, missing,
+                )
             if skipped:
                 self.status_bar.showMessage(
                     f"MobileSAM finished; {skipped} image(s) had no matching boxes",
@@ -1200,11 +1432,18 @@ class MainWindow(QMainWindow):
         return [float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys))]
 
     @staticmethod
-    def _boxMatchesLabel(shape: dict, label: Optional[str]) -> bool:
-        """Whether a shape should prompt MobileSAM for the chosen label."""
-        if label in (None, '', '__all__'):
+    def _boxMatchesLabels(shape: dict, labels: Optional[List[str]]) -> bool:
+        """Whether a shape should prompt MobileSAM for the chosen labels.
+
+        Only rectangles qualify. MobileSAM is box-prompted, and a generated
+        polygon must never feed back in as a prompt: doing so re-segments it
+        on every run and multiplies the shape count.
+        """
+        if (shape.get('shape_type') or '') != 'rectangle':
+            return False
+        if not labels:
             return True
-        return (shape.get('label') or '') == label
+        return (shape.get('label') or '') in set(labels)
 
     def _applyMobileSamResult(self, result: dict, *, remove_boxes: bool = False):
         """Add the generated polygons to each image, dropping their prompts."""
@@ -1213,6 +1452,7 @@ class MainWindow(QMainWindow):
         fallback_label = result.get('label')
         added = 0
         removed = 0
+        duplicates = 0
         others_changed = False
 
         for image_id, entries in results.items():
@@ -1246,27 +1486,34 @@ class MainWindow(QMainWindow):
                 removed += len(source_shapes) - len(kept)
                 source_shapes = kept
 
-            new_shapes = list(source_shapes) + [
-                {
-                    'label': label or fallback_label or 'object',
+            new_shapes = list(source_shapes)
+            skipped_duplicates = 0
+            for _index, label, polygon in entries:
+                final_label = label or fallback_label or 'object'
+                if self._hasEquivalentPolygon(new_shapes, final_label, polygon):
+                    # Already segmented: re-adding it would duplicate the shape
+                    # every time the user re-runs with boxes kept.
+                    skipped_duplicates += 1
+                    continue
+                new_shapes.append({
+                    'label': final_label,
                     'points': polygon,
                     'group_id': None,
                     'description': '',
                     'shape_type': 'polygon',
                     'flags': {},
                     'mask': None,
-                }
-                for _index, label, polygon in entries
-            ]
+                })
+                added += 1
+
+            duplicates += skipped_duplicates
 
             if image_id == self.current_image_id:
                 # applyShapes keeps the undo history, so both the new masks and
                 # the removed prompts can be undone with Ctrl+Z.
                 self.canvas.applyShapes(new_shapes)
-                added += len(entries)
             else:
                 self._saveShapesForImage(image, new_shapes)
-                added += len(entries)
                 others_changed = True
 
         if others_changed:
@@ -1276,15 +1523,70 @@ class MainWindow(QMainWindow):
 
         device = result.get('device')
         suffix = f" on {device}" if device else ""
+        skipped_boxes = len(result.get('skipped_boxes') or [])
         if added:
             detail = f"MobileSAM added {added} shape(s){suffix}"
             if removed:
                 detail += f", removed {removed} box(es)"
-            self.status_bar.showMessage(detail, 5000)
-        else:
+            if duplicates:
+                detail += f", skipped {duplicates} already-segmented box(es)"
+            if skipped_boxes:
+                detail += f"; {skipped_boxes} box(es) had no usable mask"
+            self.status_bar.showMessage(detail, 6000)
+        elif duplicates:
             self.status_bar.showMessage(
-                "MobileSAM produced no usable masks", 4000
+                f"MobileSAM skipped {duplicates} already-segmented box(es)",
+                5000,
             )
+        else:
+            message = "MobileSAM produced no usable masks"
+            if skipped_boxes:
+                message += f" ({skipped_boxes} box(es) below the confidence floor)"
+            self.status_bar.showMessage(message, 5000)
+
+    # Tolerance in pixels when deciding two masks are the same shape.
+    POLYGON_MATCH_TOLERANCE = 2.0
+
+    @classmethod
+    def _hasEquivalentPolygon(cls, shapes: List[dict], label: str,
+                              polygon: List[List[float]]) -> bool:
+        """Whether ``shapes`` already holds this polygon under this label.
+
+        MobileSAM is deterministic, so a re-run over the same box reproduces
+        the same outline; comparing bounds is enough to spot it. The small
+        tolerance absorbs float noise without merging genuinely distinct masks.
+        """
+        new_bounds = cls._polygonBounds(polygon)
+        if new_bounds is None:
+            return False
+        for shape in shapes:
+            if (shape.get('shape_type') or '') != 'polygon':
+                continue
+            if (shape.get('label') or '') != label:
+                continue
+            bounds = cls._polygonBounds(shape.get('points') or [])
+            if bounds is None:
+                continue
+            if all(
+                abs(a - b) <= cls.POLYGON_MATCH_TOLERANCE
+                for a, b in zip(bounds, new_bounds)
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _polygonBounds(points: List) -> Optional[List[float]]:
+        """Return ``[min_x, min_y, max_x, max_y]`` for a point list."""
+        coords = [
+            (float(p[0]), float(p[1]))
+            for p in (points or [])
+            if len(p) >= 2
+        ]
+        if not coords:
+            return None
+        xs = [c[0] for c in coords]
+        ys = [c[1] for c in coords]
+        return [min(xs), min(ys), max(xs), max(ys)]
 
     def _saveShapesForImage(self, image: dict, shapes: List[dict]):
         """Persist shapes for an image that is not currently open."""
@@ -1297,6 +1599,320 @@ class MainWindow(QMainWindow):
         save_annotation(image['id'], payload)
         update_image(image['id'], has_annotation=1)
         self._writeLabelFile(image, payload)
+
+    # ------------------------------------------------------------------
+    # YOLO
+    # ------------------------------------------------------------------
+    def yoloService(self, model_path: str, device: str = None) -> YOLOService:
+        """Return the YOLO service for a model path + device, cached."""
+        from annotation_engine.services.device import DEVICE_AUTO
+
+        wanted = device or DEVICE_AUTO
+        key = (str(model_path), wanted)
+        service = self._yolo_services.get(key)
+        if service is None:
+            service = YOLOService(model_path, device=wanted)
+            self._yolo_services[key] = service
+        return service
+
+    def loadYoloModel(self, options: dict):
+        """Load a YOLO model in the background and report its task + classes."""
+        model_path = options.get('model_path')
+        if not model_path:
+            return
+        device = options.get('device') or 'auto'
+        dialog = self._auto_annotate_dialog
+
+        def worker(progress_callback=None):
+            service = self.yoloService(model_path, device)
+            return service.load(progress_callback)
+
+        def on_done(info: dict):
+            if dialog is not None:
+                dialog.setYoloModelInfo(info.get('task'), info.get('names') or {})
+                dialog.setYoloRunning(False)
+            self.status_bar.showMessage(
+                f"YOLO model loaded ({info.get('task')})", 3000
+            )
+
+        def on_error(message: str):
+            if dialog is not None:
+                dialog.setYoloRunning(False)
+                dialog.yolo_task_label.setText("Failed to load model")
+            QMessageBox.critical(
+                self, "YOLO Load Failed", f"Could not load the model:\n{message}"
+            )
+
+        if dialog is not None:
+            dialog.setYoloRunning(True)
+        self._runBackgroundJob(
+            'yolo_load', worker, on_done, on_error, title="Loading YOLO model",
+        )
+
+    def runYolo(self, options: dict):
+        """Run YOLO inference over the chosen images in the background."""
+        if not self.current_project_id:
+            return
+
+        model_path = options.get('model_path')
+        if not model_path:
+            QMessageBox.warning(self, "YOLO", "Pick a model file first.")
+            return
+        labels = [name for name in (options.get('labels') or []) if name]
+        if not labels:
+            QMessageBox.warning(self, "YOLO", "Tick at least one label.")
+            return
+
+        conf = float(options.get('conf') or 0.25)
+        iou = float(options.get('iou') or 0.45)
+        device = options.get('device') or 'auto'
+        scope = options.get('scope') or 'current'
+
+        if scope == 'all':
+            image_ids = [img['id'] for img in get_project_images(self.current_project_id)]
+        else:
+            if not self.current_image_id:
+                QMessageBox.warning(self, "No Image", "Open an image before running YOLO.")
+                return
+            image_ids = [self.current_image_id]
+
+        # Persist in-flight edits first: shapes are appended to saved data.
+        self._flushAutosave()
+
+        tasks = []
+        for image_id in image_ids:
+            image = get_image(image_id)
+            if not image:
+                continue
+            project = get_project(self.current_project_id)
+            if not project:
+                return
+            tasks.append({
+                'image_id': image_id,
+                'image_path': os.path.join(project['base_path'], image['relative_path']),
+            })
+
+        if not tasks:
+            return
+
+        def worker(progress_callback=None):
+            service = self.yoloService(model_path, device)
+            results = {}
+            total = len(tasks)
+            for index, task in enumerate(tasks):
+                def report(percent, message, _i=index):
+                    overall = int(((_i + percent / 100) / total) * 100)
+                    progress_callback(overall, message)
+                results[task['image_id']] = service.predict(
+                    task['image_path'], labels, conf, iou, report
+                )
+            return {'results': results, 'device': service.device_description}
+
+        def on_done(result: dict):
+            self._applyYoloResult(result)
+
+        def on_error(message: str):
+            QMessageBox.critical(
+                self, "YOLO Failed", f"Inference failed:\n{message}"
+            )
+
+        self._yolo_job = self._runBackgroundJob(
+            'yolo', worker, on_done, on_error, title="Running YOLO",
+        )
+
+    def _applyYoloResult(self, result: dict):
+        """Add generated shapes; undoable on the current image, else a write."""
+        results = result.get('results') or {}
+        added = 0
+        others_changed = False
+
+        for image_id, shapes in results.items():
+            if not shapes:
+                continue
+            image = get_image(image_id)
+            if not image:
+                continue
+
+            if image_id == self.current_image_id:
+                self.canvas.appendShapes(shapes)
+            else:
+                annotation = get_annotation(image_id)
+                existing = annotation['data'].get('shapes', []) if annotation else []
+                self._saveShapesForImage(image, list(existing) + list(shapes))
+                others_changed = True
+            added += len(shapes)
+
+        if others_changed:
+            self._syncGridAnnotations()
+
+        device = result.get('device')
+        suffix = f" on {device}" if device else ""
+        if added:
+            self.status_bar.showMessage(f"YOLO added {added} shape(s){suffix}", 6000)
+        else:
+            self.status_bar.showMessage("YOLO produced no detections", 5000)
+
+    # ------------------------------------------------------------------
+    # Grounding DINO
+    # ------------------------------------------------------------------
+    def _hfApiKey(self) -> str:
+        encrypted = get_setting('hf_api_key_encrypted', '') or ''
+        return self.encryption.decrypt(encrypted) if encrypted else ''
+
+    def groundingDinoMode(self) -> str:
+        if self._grounding_dino_mode is None:
+            self._grounding_dino_mode = grounding_dino_mode()
+        return self._grounding_dino_mode
+
+    def localGroundingDinoService(self, device: str = None):
+        from annotation_engine.services.device import DEVICE_AUTO
+
+        key = device or DEVICE_AUTO
+        service = self._local_grounding_dino.get(key)
+        if service is None:
+            service = LocalGroundingDINOService(device=key)
+            self._local_grounding_dino[key] = service
+        return service
+
+    def runGroundingDINO(self, options: dict):
+        """Run Grounding DINO (local GPU or HF cloud) in the background."""
+        if not self.current_project_id:
+            return
+        prompts = [p for p in (options.get('prompts') or []) if p]
+        if not prompts:
+            return
+        threshold = float(options.get('threshold') or 0.3)
+        device = options.get('device') or 'auto'
+        scope = options.get('scope') or 'current'
+        mode = options.get('mode') or self.groundingDinoMode()
+
+        api_key = ''
+        if mode == 'cloud':
+            api_key = self._hfApiKey()
+            if not api_key:
+                QMessageBox.warning(
+                    self, "Grounding DINO",
+                    "Cloud mode requires a Hugging Face API key.\n"
+                    "Set it in Settings → API Keys.",
+                )
+                return
+            scope = 'current'  # cloud processes one image at a time
+
+        if scope == 'all':
+            image_ids = [img['id'] for img in get_project_images(self.current_project_id)]
+        else:
+            if not self.current_image_id:
+                QMessageBox.warning(self, "No Image", "Open an image before running Grounding DINO.")
+                return
+            image_ids = [self.current_image_id]
+
+        self._flushAutosave()
+
+        tasks = []
+        for image_id in image_ids:
+            image = get_image(image_id)
+            if not image:
+                continue
+            project = get_project(self.current_project_id)
+            if not project:
+                return
+            tasks.append({
+                'image_id': image_id,
+                'image_path': os.path.join(project['base_path'], image['relative_path']),
+            })
+        if not tasks:
+            return
+
+        text_prompt = ', '.join(prompts)
+
+        def worker(progress_callback=None):
+            if mode == 'local':
+                service = self.localGroundingDinoService(device)
+                device_label = service.device_description
+            else:
+                service = GroundingDINOSync(api_key)
+                device_label = 'cloud'
+            results = {}
+            total = len(tasks)
+            for i, task in enumerate(tasks):
+                def report(percent, message, _i=i):
+                    overall = int(((_i + percent / 100) / total) * 100)
+                    progress_callback(overall, message)
+                try:
+                    if mode == 'local':
+                        dets = service.detect(task['image_path'], prompts, threshold, report)
+                    else:
+                        dets = service.detect(task['image_path'], text_prompt, threshold, report)
+                    results[task['image_id']] = dets
+                except Exception as exc:
+                    logger.warning(
+                        "Grounding DINO failed on image %s: %s", task['image_id'], exc
+                    )
+                    results[task['image_id']] = []
+            return {'results': results, 'mode': mode, 'device': device_label}
+
+        def on_done(result: dict):
+            self._applyGroundingDinoResult(result)
+
+        def on_error(message: str):
+            QMessageBox.critical(
+                self, "Grounding DINO Failed", f"Inference failed:\n{message}"
+            )
+
+        self._grounding_dino_job = self._runBackgroundJob(
+            'grounding_dino', worker, on_done, on_error,
+            title="Running Grounding DINO",
+        )
+
+    def _applyGroundingDinoResult(self, result: dict):
+        """Add detected rectangles; undoable current, direct write for others."""
+        results = result.get('results') or {}
+        added = 0
+        others_changed = False
+        for image_id, detections in results.items():
+            if not detections:
+                continue
+            image = get_image(image_id)
+            if not image:
+                continue
+
+            shapes = []
+            for det in detections:
+                box = det.get('box') or []
+                if len(box) < 4:
+                    continue
+                x1, y1, x2, y2 = box[:4]
+                shapes.append({
+                    'label': det.get('label') or 'object',
+                    'points': [[x1, y1], [x2, y2]],
+                    'group_id': None,
+                    'description': '',
+                    'shape_type': 'rectangle',
+                    'flags': {},
+                    'mask': None,
+                })
+            if not shapes:
+                continue
+
+            if image_id == self.current_image_id:
+                self.canvas.appendShapes(shapes)
+            else:
+                annotation = get_annotation(image_id)
+                existing = annotation['data'].get('shapes', []) if annotation else []
+                self._saveShapesForImage(image, list(existing) + shapes)
+                others_changed = True
+            added += len(shapes)
+
+        if others_changed:
+            self._syncGridAnnotations()
+
+        mode = result.get('mode')
+        if added:
+            self.status_bar.showMessage(
+                f"Grounding DINO added {added} shape(s) ({mode})", 6000
+            )
+        else:
+            self.status_bar.showMessage("Grounding DINO found no objects", 5000)
 
     def _runBackgroundJob(self, job_type: str, worker, on_done, on_error,
                           *, title: str) -> str:
@@ -1318,6 +1934,10 @@ class MainWindow(QMainWindow):
 
         if job_type == 'mobile_sam' and self._auto_annotate_dialog is not None:
             self._auto_annotate_dialog.setMobileSamRunning(True)
+        if job_type == 'yolo' and self._auto_annotate_dialog is not None:
+            self._auto_annotate_dialog.setYoloRunning(True)
+        if job_type == 'grounding_dino' and self._auto_annotate_dialog is not None:
+            self._auto_annotate_dialog.setGroundingDinoRunning(True)
 
         job_id = self.job_queue.enqueue(job_type, run)
         holder['job_id'] = job_id
@@ -1363,6 +1983,14 @@ class MainWindow(QMainWindow):
             self._mobile_sam_job = None
             if self._auto_annotate_dialog is not None:
                 self._auto_annotate_dialog.setMobileSamRunning(False)
+        elif job_type == 'yolo':
+            self._yolo_job = None
+            if self._auto_annotate_dialog is not None:
+                self._auto_annotate_dialog.setYoloRunning(False)
+        elif job_type == 'grounding_dino':
+            self._grounding_dino_job = None
+            if self._auto_annotate_dialog is not None:
+                self._auto_annotate_dialog.setGroundingDinoRunning(False)
     
     def onJobStarted(self, job_id: str):
         if job_id in self._managed_jobs:
@@ -1508,5 +2136,19 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
         
+        self._stopPrewarm()
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
         self.saveSettings()
         super().closeEvent(event)
+    
+    def _stopPrewarm(self):
+        """Wait for the warm-up thread so it is never destroyed mid-run."""
+        thread = self._prewarm_thread
+        if thread is None:
+            return
+        thread.quit()
+        thread.wait(5000)
+        self._prewarm_thread = None
+        self._prewarm_worker = None

@@ -570,6 +570,22 @@ def set_setting(key: str, value: Any) -> bool:
     )
     return cursor.rowcount > 0
 
+
+def get_last_image_id(project_id: int) -> Optional[int]:
+    """Return the image a project was last left on, if still known."""
+    value = get_setting(f"last_image:{project_id}")
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def set_last_image_id(project_id: int, image_id: Optional[int]) -> None:
+    """Remember which image a project was last viewing."""
+    if not project_id or image_id is None:
+        return
+    set_setting(f"last_image:{project_id}", int(image_id))
+
 # Recent projects
 def add_recent_project(project_id: int) -> None:
     """Add project to recent list."""

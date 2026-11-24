@@ -86,6 +86,9 @@ class MobileSAMService:
         self.device_preference = device
         self.device = resolve_device(device)
         self._model = None
+        # Filled by the last segment_from_boxes / segment_labeled call.
+        self.last_skipped: List[int] = []
+        self.last_skipped_labels: List[str] = []
 
     @property
     def device_description(self) -> str:
@@ -182,13 +185,15 @@ class MobileSAMService:
             image: BGR image as a numpy array.
             boxes: Boxes in original image pixel coordinates.
             progress_callback: Optional ``(percent, message)`` reporter.
-            min_score: Drop masks whose confidence is below this value. The
-                model does not always report scores, in which case every mask
-                is kept.
+            min_score: Masks whose confidence is below this value are skipped
+                (returned as all-zero masks). The model does not always report
+                scores, in which case every mask is kept.
 
         Returns:
-            One boolean mask per input box, in the same order.
+            One boolean mask per input box, in the same order, so a mask can
+            always be traced back to the box that prompted it.
         """
+        self.last_skipped: List[int] = []
         if not boxes:
             return []
 
@@ -203,10 +208,22 @@ class MobileSAMService:
         masks = results[0].masks
         if masks is None or len(masks) == 0:
             _report(progress_callback, 100, "No masks produced")
+            self.last_skipped = list(range(len(boxes)))
             return [np.zeros((height, width), dtype=bool) for _ in boxes]
 
         arrays = masks.data.cpu().numpy()
+        if len(arrays) != len(boxes):
+            # Should not happen now that predict runs with conf=0, but a
+            # shortened list would silently misalign masks with prompts.
+            logger.warning(
+                "MobileSAM returned %d masks for %d boxes; treating as unusable",
+                len(arrays), len(boxes),
+            )
+            self.last_skipped = list(range(len(boxes)))
+            return [np.zeros((height, width), dtype=bool) for _ in boxes]
+
         keep = self._scoreMask(results[0], len(arrays), min_score)
+        self.last_skipped = [i for i, wanted in enumerate(keep) if not wanted]
         _report(progress_callback, 100, f"Generated {len(arrays)} mask(s)")
 
         output: List[np.ndarray] = []
@@ -229,12 +246,14 @@ class MobileSAMService:
         batch; retrying the image on CPU keeps the run productive.
         """
         prompts = [list(map(float, box)) for box in boxes]
+        # conf=0 keeps every mask Ultralytics produced. Its own 0.25 filter
+        # shortens the mask list, which would misalign masks with prompts.
+        options = dict(
+            source=image, bboxes=prompts, conf=0.0, verbose=False
+        )
         try:
             return model.predict(
-                source=image,
-                bboxes=prompts,
-                device=ultralytics_device(self.device),
-                verbose=False,
+                device=ultralytics_device(self.device), **options
             )
         except Exception as exc:
             if not self._is_cuda() or not self._is_out_of_memory(exc):
@@ -244,9 +263,7 @@ class MobileSAMService:
             )
             self._release_cuda(model)
             self.device = DEVICE_CPU
-            return model.predict(
-                source=image, bboxes=prompts, device=DEVICE_CPU, verbose=False
-            )
+            return model.predict(device=DEVICE_CPU, **options)
 
     @staticmethod
     def _is_out_of_memory(exc: Exception) -> bool:
@@ -339,17 +356,23 @@ class MobileSAMService:
         Returns:
             ``(prompt_index, label, polygon)`` per usable mask. Boxes whose mask
             has no drawable contour are omitted.
+
+        ``self.last_skipped_labels`` records the labels of the omitted boxes so
+        the caller can report them instead of losing them silently.
         """
         masks = self.segment(
             image_path, boxes, progress_callback, min_score=min_score
         )
         results: List[Tuple[int, str, List[List[float]]]] = []
+        skipped: List[str] = []
         for index, mask in enumerate(masks):
             polygon = mask_to_polygon(mask)
-            if not polygon:
-                continue
             label = labels[index] if index < len(labels) else ''
+            if not polygon:
+                skipped.append(label or f"box {index}")
+                continue
             results.append((index, label, polygon))
+        self.last_skipped_labels = skipped
         return results
 
     def batch_segment(

@@ -1,10 +1,10 @@
 """
 AnnotationEngine Desktop - Label List Widget
 """
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem,
+    QWidget, QVBoxLayout, QHBoxLayout, QTreeWidget, QTreeWidgetItem,
     QPushButton, QLabel, QLineEdit, QColorDialog, QMenu, QInputDialog
 )
 from PySide6.QtCore import Signal, Slot, Qt, QSize, QSignalBlocker, QPoint, QEvent
@@ -144,7 +144,7 @@ class LabelItemWidget(QWidget):
 
 
 class LabelListWidget(QWidget):
-    """Widget for managing annotation labels."""
+    """Widget for managing annotation labels, with per-layer instance rows."""
     
     labelSelected = Signal(str)
     labelVisibilityChanged = Signal(str, bool)
@@ -154,12 +154,15 @@ class LabelListWidget(QWidget):
     removeLabelRequested = Signal(str)
     renameLabelRequested = Signal(str)
     labelsChanged = Signal()
+    instanceClicked = Signal(int)        # canvas shape index
+    instanceDeleteRequested = Signal(int)  # canvas shape index
     
     def __init__(self, parent=None):
         super().__init__(parent)
         
         self.labels: Dict[str, Dict] = {}  # label -> {color, visible, count}
         self._color_memory: Dict[str, str] = {}  # survives removal (undo, rename)
+        self.instances: Dict[str, List[Tuple[int, str]]] = {}  # label -> (index, shape_type)
         self._loading = False
         self.setupUI()
     
@@ -183,11 +186,11 @@ class LabelListWidget(QWidget):
         
         layout.addWidget(header)
         
-        # Label list
-        self.list_widget = QListWidget()
-        self.list_widget.setSpacing(2)
+        # Label tree (top-level = label, children = overlapping instances)
+        self.list_widget = QTreeWidget()
+        self.list_widget.setHeaderHidden(True)
+        self.list_widget.setRootIsDecorated(True)
         self.list_widget.setAlternatingRowColors(True)
-        self.list_widget.setWordWrap(True)
         self.list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.list_widget.customContextMenuRequested.connect(self._onContextMenu)
         self.list_widget.itemClicked.connect(self.onItemClicked)
@@ -232,12 +235,11 @@ class LabelListWidget(QWidget):
         return label
     
     def _addLabelToList(self, label: str, color: str, visible: bool):
-        """Add label widget to list."""
+        """Add label widget to the tree."""
         label = str(label)
-        item = QListWidgetItem()
-        item.setSizeHint(QSize(0, 44))
-        item.setData(Qt.UserRole, label)
-        item.setToolTip(label)
+        item = QTreeWidgetItem()
+        item.setData(0, Qt.UserRole, label)
+        item.setToolTip(0, label)
         
         widget = LabelItemWidget(label, color, visible)
         widget.setCount(0)
@@ -245,8 +247,8 @@ class LabelListWidget(QWidget):
         widget.colorChanged.connect(self._onLabelColorChanged)
         widget.contextMenuRequested.connect(self.showLabelMenu)
         
-        self.list_widget.addItem(item)
-        self.list_widget.setItemWidget(item, widget)
+        self.list_widget.addTopLevelItem(item)
+        self.list_widget.setItemWidget(item, 0, widget)
     
     def _onLabelColorChanged(self, label: str, color: str):
         if label in self.labels:
@@ -309,9 +311,9 @@ class LabelListWidget(QWidget):
         self._color_memory[new] = old_data.get('color', '')
         item = self._findItem(old)
         if item is not None:
-            item.setData(Qt.UserRole, new)
-            item.setToolTip(new)
-            widget = self.list_widget.itemWidget(item)
+            item.setData(0, Qt.UserRole, new)
+            item.setToolTip(0, new)
+            widget = self.list_widget.itemWidget(item, 0)
             if widget is not None:
                 widget.label = new
                 widget.label_text.setText(new)
@@ -321,26 +323,52 @@ class LabelListWidget(QWidget):
         return old_data.get('color', '')
     
     def syncFromShapes(self, shapes: List[dict]):
-        """Add labels found in shapes and refresh per-label counts."""
+        """Add labels found in shapes, refresh counts, and rebuild instance rows.
+
+        ``shapes`` is the current image's shape list in z-order (index 0 is the
+        bottom layer, the last is the top), so the per-label child rows can be
+        ordered by layer.
+        """
         counts: Dict[str, int] = {}
-        for shape in shapes or []:
+        instances: Dict[str, List[Tuple[int, str]]] = {}
+        for index, shape in enumerate(shapes or []):
             label = shape.get('label') or ''
             if not label:
                 continue
             counts[label] = counts.get(label, 0) + 1
             if label not in self.labels:
                 self.addLabel(label)
+            instances.setdefault(label, []).append(
+                (index, shape.get('shape_type') or 'polygon')
+            )
         
+        self.instances = instances
         for label in self.labels:
             self.setLabelCount(label, counts.get(label, 0))
+            self._setInstances(label, instances.get(label, []))
+    
+    def _setInstances(self, label: str, entries: List[Tuple[int, str]]):
+        """Rebuild the child rows for a label, top layer first."""
+        item = self._findItem(label)
+        if item is None:
+            return
+        was_expanded = item.isExpanded()
+        item.takeChildren()
+        for pos, (index, shape_type) in enumerate(reversed(entries), start=1):
+            text = f"Layer 1 (top) · {shape_type}" if pos == 1 else f"Layer {pos} · {shape_type}"
+            child = QTreeWidgetItem([text])
+            child.setData(0, Qt.UserRole, index)
+            child.setToolTip(0, text)
+            item.addChild(child)
+        item.setExpanded(was_expanded)
     
     def setSelectedLabels(self, labels: List[str]):
-        """Highlight the list rows for the given labels."""
+        """Highlight the top-level rows for the given labels."""
         labels = set(labels or [])
         self.list_widget.clearSelection()
-        for i in range(self.list_widget.count()):
-            item = self.list_widget.item(i)
-            if item and item.data(Qt.UserRole) in labels:
+        for i in range(self.list_widget.topLevelItemCount()):
+            item = self.list_widget.topLevelItem(i)
+            if item and item.data(0, Qt.UserRole) in labels:
                 item.setSelected(True)
     
     def getLabels(self) -> List[str]:
@@ -357,10 +385,10 @@ class LabelListWidget(QWidget):
     
     def currentLabel(self) -> str:
         """Return the currently highlighted label, if any."""
-        items = self.list_widget.selectedItems()
-        if not items:
-            return ""
-        return items[0].data(Qt.UserRole) or ""
+        for item in self.list_widget.selectedItems():
+            if item.parent() is None:
+                return item.data(0, Qt.UserRole) or ""
+        return ""
     
     def setLabelCount(self, label: str, count: int):
         """Update shape count for label."""
@@ -368,7 +396,7 @@ class LabelListWidget(QWidget):
             return
         self.labels[label]['count'] = count
         item = self._findItem(label)
-        widget = self.list_widget.itemWidget(item) if item else None
+        widget = self.list_widget.itemWidget(item, 0) if item else None
         if widget is not None:
             widget.setCount(count)
     
@@ -379,7 +407,7 @@ class LabelListWidget(QWidget):
         self.labels[label]['visible'] = bool(visible)
 
         item = self._findItem(label)
-        widget = self.list_widget.itemWidget(item) if item else None
+        widget = self.list_widget.itemWidget(item, 0) if item else None
         if widget is not None:
             blocker = QSignalBlocker(widget.visible_cb)
             widget.visible_cb.setChecked(bool(visible))
@@ -387,21 +415,44 @@ class LabelListWidget(QWidget):
             widget.visible = bool(visible)
             widget._updateVisibilityIcon()
     
-    def onItemClicked(self, item: QListWidgetItem):
-        """Handle label item click."""
-        widget = self.list_widget.itemWidget(item)
-        if widget:
+    def onItemClicked(self, item: QTreeWidgetItem, column: int):
+        """Handle a click on a label row or an instance row."""
+        if item is None:
+            return
+        if item.parent() is not None:
+            index = item.data(0, Qt.UserRole)
+            if isinstance(index, int):
+                self.instanceClicked.emit(index)
+            return
+        widget = self.list_widget.itemWidget(item, 0)
+        if widget is not None:
             self.labelSelected.emit(widget.label)
 
     def _onContextMenu(self, pos):
-        """Show actions for the label under the cursor (list background)."""
+        """Route a right-click to the label menu or an instance menu."""
         item = self.list_widget.itemAt(pos)
         if item is None:
             return
-        label = item.data(Qt.UserRole)
-        if not label:
+        global_pos = self.list_widget.viewport().mapToGlobal(pos)
+        if item.parent() is not None:
+            index = item.data(0, Qt.UserRole)
+            if isinstance(index, int):
+                self._showInstanceMenu(index, global_pos)
             return
-        self.showLabelMenu(label, self.list_widget.viewport().mapToGlobal(pos))
+        label = item.data(0, Qt.UserRole)
+        if label:
+            self.showLabelMenu(label, global_pos)
+
+    def _showInstanceMenu(self, index: int, global_pos: QPoint):
+        """Context menu for a single shape instance (a layer of a label)."""
+        menu = QMenu(self)
+        select_action = menu.addAction("Select Shape")
+        delete_action = menu.addAction("Delete Shape")
+        chosen = menu.exec(global_pos)
+        if chosen is select_action:
+            self.instanceClicked.emit(index)
+        elif chosen is delete_action:
+            self.instanceDeleteRequested.emit(index)
 
     def showLabelMenu(self, label: str, global_pos: QPoint):
         """Show the label context menu at a global position."""
@@ -428,18 +479,18 @@ class LabelListWidget(QWidget):
         """Return the recorded shape count for a label."""
         return int(self.labels.get(label, {}).get('count', 0))
 
-    def _findItem(self, label: str) -> Optional[QListWidgetItem]:
-        for i in range(self.list_widget.count()):
-            item = self.list_widget.item(i)
-            if item and item.data(Qt.UserRole) == label:
+    def _findItem(self, label: str) -> Optional[QTreeWidgetItem]:
+        for i in range(self.list_widget.topLevelItemCount()):
+            item = self.list_widget.topLevelItem(i)
+            if item and item.data(0, Qt.UserRole) == label:
                 return item
         return None
 
     def _removeRow(self, label: str) -> None:
-        for i in range(self.list_widget.count() - 1, -1, -1):
-            item = self.list_widget.item(i)
-            if item and item.data(Qt.UserRole) == label:
-                self.list_widget.takeItem(i)
+        for i in range(self.list_widget.topLevelItemCount() - 1, -1, -1):
+            item = self.list_widget.topLevelItem(i)
+            if item and item.data(0, Qt.UserRole) == label:
+                self.list_widget.takeTopLevelItem(i)
 
     def removeLabel(self, label: str) -> bool:
         """Remove a label row and its stored metadata."""
@@ -455,4 +506,5 @@ class LabelListWidget(QWidget):
         """Clear all labels (and the remembered colors of another project)."""
         self.labels.clear()
         self._color_memory.clear()
+        self.instances.clear()
         self.list_widget.clear()

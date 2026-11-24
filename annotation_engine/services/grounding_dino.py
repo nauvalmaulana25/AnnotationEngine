@@ -1,11 +1,137 @@
 """
 AnnotationEngine Desktop - Grounding DINO Service
+
+Two backends:
+
+* ``LocalGroundingDINOService`` runs ``IDEA-Research/grounding-dino-tiny``
+  locally via ``transformers`` when a CUDA GPU with enough VRAM is available.
+* ``GroundingDINOService`` / ``GroundingDINOSync`` offload to the Hugging Face
+  Inference API (used when local inference is not possible).
+
+:func:`grounding_dino_mode` picks the backend from the hardware.
 """
-import httpx
 import base64
 import os
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Callable
+
+import httpx
+
+from annotation_engine.services.device import (
+    DEVICE_AUTO,
+    DEVICE_CPU,
+    can_run_local_grounding_dino,
+    describe_device,
+    resolve_device,
+)
+
+# Hugging Face model backing the local path (public; no token required).
+GROUNDING_DINO_MODEL_ID = "IDEA-Research/grounding-dino-tiny"
+
+
+def grounding_dino_mode() -> str:
+    """Return ``"local"`` when a GPU with enough VRAM is available, else ``"cloud"``."""
+    return "local" if can_run_local_grounding_dino() else "cloud"
+
+
+class LocalGroundingDINOService:
+    """Grounding DINO object detection running locally via transformers."""
+
+    def __init__(self, model_id: str = GROUNDING_DINO_MODEL_ID,
+                 device: str = DEVICE_AUTO):
+        self.model_id = model_id
+        self.device_preference = device
+        self.device = resolve_device(device)
+        self._processor = None
+        self._model = None
+
+    @property
+    def device_description(self) -> str:
+        return describe_device(self.device)
+
+    def load(self, progress_callback: Optional[Callable[[int, str], None]] = None):
+        """Load the transformers model, deferring the (slow) imports."""
+        if self._model is not None:
+            return
+        if progress_callback:
+            progress_callback(
+                0, f"Loading {self.model_id} on {self.device_description}"
+            )
+        from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
+
+        self._processor = AutoProcessor.from_pretrained(self.model_id)
+        self._model = AutoModelForZeroShotObjectDetection.from_pretrained(
+            self.model_id
+        )
+        try:
+            self._model.to(self.device)
+        except Exception:  # a device that vanished mid-run
+            self.device = DEVICE_CPU
+            self._model.to(DEVICE_CPU)
+        self._model.eval()
+        if progress_callback:
+            progress_callback(100, "Grounding DINO loaded")
+
+    def detect(
+        self,
+        image_path: str,
+        prompts: List[str],
+        threshold: float = 0.3,
+        progress_callback: Optional[Callable[[int, str], None]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Detect ``prompts`` and return ``[{label, score, box}]`` entries."""
+        import torch
+        from PIL import Image
+
+        self.load(progress_callback)
+        image = Image.open(image_path).convert("RGB")
+        height, width = image.height, image.width
+
+        detections: List[Dict[str, Any]] = []
+        total = max(len(prompts), 1)
+        for i, prompt in enumerate(prompts):
+            if progress_callback:
+                progress_callback(
+                    int((i / total) * 100), f"Detecting '{prompt}'"
+                )
+            text = f"{prompt}."
+            inputs = self._processor(
+                images=image, text=text, return_tensors="pt"
+            ).to(self.device)
+            with torch.no_grad():
+                outputs = self._model(**inputs)
+            results = self._processor.post_process_grounded_object_detection(
+                outputs,
+                inputs.input_ids,
+                threshold=threshold,
+                target_sizes=[(height, width)],
+            )
+            if not results:
+                continue
+            result = results[0]
+            boxes = result.get("boxes")
+            if boxes is None or len(boxes) == 0:
+                continue
+            boxes = boxes.cpu().tolist()
+            scores = result.get("scores")
+            score_list = (
+                scores.cpu().tolist() if scores is not None else [1.0] * len(boxes)
+            )
+            for box, score in zip(boxes, score_list):
+                x1, y1, x2, y2 = box
+                detections.append({
+                    'label': prompt,
+                    'score': float(score),
+                    'box': [float(x1), float(y1), float(x2), float(y2)],
+                })
+
+        if progress_callback:
+            progress_callback(100, f"Found {len(detections)} objects")
+        return detections
+
+    def unload(self):
+        self._model = None
+        self._processor = None
 
 
 class GroundingDINOService:

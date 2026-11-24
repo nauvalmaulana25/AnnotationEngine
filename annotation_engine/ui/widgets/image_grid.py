@@ -2,6 +2,7 @@
 AnnotationEngine Desktop - Sidebar Widget (Image Grid)
 """
 import os
+import math
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -39,6 +40,8 @@ class ImageGridModel(QAbstractListModel):
         self.label_colors: Dict[str, str] = {}
         self.label_visibility: Dict[str, bool] = {}
         self.show_overlays: bool = True
+        # Image the project should reopen on; marked in the delegates.
+        self.last_seen_id: Optional[int] = None
     
     def rowCount(self, parent=QModelIndex()) -> int:
         return len(self.images)
@@ -67,6 +70,10 @@ class ImageGridModel(QAbstractListModel):
         elif role == Qt.UserRole + 1:
             # 1-based index number (position in the ordered image list).
             return index.row() + 1
+        
+        elif role == Qt.UserRole + 2:
+            # Whether this is the image the project last opened on.
+            return self.last_seen_id is not None and image.get('id') == self.last_seen_id
         
         elif role == Qt.CheckStateRole:
             return Qt.Checked if image.get('_selected', False) else Qt.Unchecked
@@ -138,7 +145,26 @@ class ImageGridModel(QAbstractListModel):
         if show == self.show_overlays:
             return
         self.show_overlays = show
-        self.layoutChanged.emit()
+        # Only the DecorationRole thumbnails changed — signal a data change,
+        # not a layout reset (layoutChanged mid-event crashes the view).
+        if self.images:
+            self.dataChanged.emit(
+                self.index(0, 0),
+                self.index(len(self.images) - 1, 0),
+                [Qt.DecorationRole],
+            )
+
+    def setLastSeen(self, image_id: Optional[int]):
+        """Mark which image the project should reopen on."""
+        if self.last_seen_id == image_id:
+            return
+        self.last_seen_id = image_id
+        if self.images:
+            self.dataChanged.emit(
+                self.index(0, 0),
+                self.index(len(self.images) - 1, 0),
+                [Qt.UserRole + 2],
+            )
 
     def invalidateOverlay(self, image_id: int):
         """Drop a single image's cached overlay so it is recomposed next paint."""
@@ -207,11 +233,15 @@ class ImageGridModel(QAbstractListModel):
 
             shape_type = shape.get('shape_type') or 'polygon'
             points = shape.get('points') or []
-            pts = [
-                QPoint(int(p[0] * sx), int(p[1] * sy))
-                for p in points
-                if len(p) >= 2
-            ]
+            pts = []
+            for p in points:
+                if not isinstance(p, (list, tuple)) or len(p) < 2:
+                    continue
+                x = self._scaledCoord(p[0], sx)
+                y = self._scaledCoord(p[1], sy)
+                if x is None or y is None:
+                    continue
+                pts.append(QPoint(int(x), int(y)))
             if not pts:
                 continue
 
@@ -253,11 +283,26 @@ class ImageGridModel(QAbstractListModel):
         painter.end()
         return composed
 
+    @staticmethod
+    def _scaledCoord(coord, scale, limit: float = 1_000_000.0):
+        """Scale one coordinate, rejecting non-finite values and clamping huge ones.
+
+        A non-numeric or non-finite coordinate (NaN/inf) would otherwise be fed
+        into ``QPoint(int(...))``, which can overflow and crash the C++ painter.
+        """
+        try:
+            value = float(coord) * scale
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value):
+            return None
+        return max(-limit, min(limit, value))
+
     def _paintMaskShape(self, painter: QPainter, color: QColor, shape: dict,
                         img_w: int, img_h: int, sx: float, sy: float):
         """Draw a mask shape, falling back to its bounding box outline."""
         mask = shape.get('mask')
-        if mask:
+        if isinstance(mask, (list, tuple)):
             fill = QColor(color)
             fill.setAlpha(70)
             pen = QPen(QColor(color))
@@ -265,20 +310,29 @@ class ImageGridModel(QAbstractListModel):
             painter.setPen(pen)
             painter.setBrush(fill)
             for rect in mask:
-                # rect = [x0, y0, x1, y1] in image coords
-                if len(rect) < 4:
+                if not isinstance(rect, (list, tuple)) or len(rect) < 4:
                     continue
-                x0, y0, x1, y1 = rect[:4]
+                x0 = self._scaledCoord(rect[0], sx)
+                y0 = self._scaledCoord(rect[1], sy)
+                x1 = self._scaledCoord(rect[2], sx)
+                y1 = self._scaledCoord(rect[3], sy)
+                if None in (x0, y0, x1, y1):
+                    continue
                 painter.drawRect(
-                    QRect(int(x0 * sx), int(y0 * sy),
-                          int((x1 - x0) * sx) + 1, int((y1 - y0) * sy) + 1)
+                    QRect(int(x0), int(y0), int(x1 - x0) + 1, int(y1 - y0) + 1)
                 )
         else:
             points = shape.get('points') or []
-            if not points:
-                return
-            xs = [p[0] for p in points if len(p) >= 2]
-            ys = [p[1] for p in points if len(p) >= 2]
+            xs, ys = [], []
+            for p in points:
+                if not isinstance(p, (list, tuple)) or len(p) < 2:
+                    continue
+                x = self._scaledCoord(p[0], sx)
+                y = self._scaledCoord(p[1], sy)
+                if x is None or y is None:
+                    continue
+                xs.append(x)
+                ys.append(y)
             if not xs:
                 return
             pen = QPen(QColor(color))
@@ -286,9 +340,9 @@ class ImageGridModel(QAbstractListModel):
             painter.setPen(pen)
             painter.setBrush(Qt.NoBrush)
             painter.drawRect(
-                QRect(int(min(xs) * sx), int(min(ys) * sy),
-                      int((max(xs) - min(xs)) * sx) + 1,
-                      int((max(ys) - min(ys)) * sy) + 1)
+                QRect(int(min(xs)), int(min(ys)),
+                      int(max(xs) - min(xs)) + 1,
+                      int(max(ys) - min(ys)) + 1)
             )
     
     def getImage(self, row: int) -> Optional[Dict]:
@@ -296,6 +350,24 @@ class ImageGridModel(QAbstractListModel):
         if 0 <= row < len(self.images):
             return self.images[row]
         return None
+
+    def labelCounts(self, image_id: int) -> Dict[str, int]:
+        """Return ``{label: count}`` for one image's saved shapes."""
+        counts: Dict[str, int] = {}
+        for shape in self.annotations.get(image_id) or []:
+            label = (shape or {}).get('label') or ''
+            if label:
+                counts[label] = counts.get(label, 0) + 1
+        return counts
+
+    def annotationState(self, image_id: int) -> str:
+        """Classify an image: 'none', 'has', or 'duplicate'."""
+        counts = self.labelCounts(image_id)
+        if not counts:
+            return 'none'
+        if any(n >= 2 for n in counts.values()):
+            return 'duplicate'
+        return 'has'
 
 
 class ImageThumbnailDelegate(QStyledItemDelegate):
@@ -392,6 +464,18 @@ class ImageThumbnailDelegate(QStyledItemDelegate):
                 QRect(thumb_rect.right() - 20, thumb_rect.bottom() - 20, 20, 20),
                 Qt.AlignCenter, "✓"
             )
+
+        # "Last seen" marker: the image the project reopens on.
+        if index.data(Qt.UserRole + 2):
+            badge_rect = QRect(
+                rect.x() + self.padding,
+                rect.y() + self.padding + 24,
+                62, 18
+            )
+            painter.fillRect(badge_rect, QColor(COLORS['primary_500']))
+            painter.setPen(Qt.white)
+            painter.setFont(QFont("Arial", 8, QFont.Bold))
+            painter.drawText(badge_rect, Qt.AlignCenter, "LAST SEEN")
     
     def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:
         return QSize(self.thumb_size + self.padding * 2, self.thumb_size + self.padding * 2 + 60)
@@ -429,6 +513,18 @@ class ImageListDelegate(QStyledItemDelegate):
         )
         painter.drawText(text_rect, Qt.AlignLeft | Qt.AlignVCenter, text)
 
+        # "Last seen" marker: the image the project reopens on.
+        if index.data(Qt.UserRole + 2):
+            badge_rect = QRect(
+                rect.right() - 78,
+                rect.y() + 3,
+                72, self.row_height - 6
+            )
+            painter.fillRect(badge_rect, QColor(COLORS['primary_500']))
+            painter.setPen(Qt.white)
+            painter.setFont(QFont("Arial", 8, QFont.Bold))
+            painter.drawText(badge_rect, Qt.AlignCenter, "LAST SEEN")
+
     def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:
         return QSize(0, self.row_height)
 
@@ -440,6 +536,8 @@ class ImageFilterProxyModel(QSortFilterProxyModel):
         super().__init__(parent)
         self._search = ""
         self._split = "All"
+        self._annotation = "all"  # "all" | "has" | "none" | "duplicate"
+        self._label = None        # a specific label name, or None for "Any"
 
     def setSearch(self, text: str):
         self._search = (text or "").strip().lower()
@@ -447,6 +545,14 @@ class ImageFilterProxyModel(QSortFilterProxyModel):
 
     def setSplit(self, split: str):
         self._split = split or "All"
+        self.invalidateFilter()
+
+    def setAnnotationFilter(self, category: str):
+        self._annotation = category or "all"
+        self.invalidateFilter()
+
+    def setLabelFilter(self, label: Optional[str]):
+        self._label = label or None
         self.invalidateFilter()
 
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
@@ -468,6 +574,21 @@ class ImageFilterProxyModel(QSortFilterProxyModel):
                 return True
             return False
 
+        if self._annotation != "all":
+            state = model.annotationState(image['id'])
+            if self._annotation == "none" and state != "none":
+                return False
+            if self._annotation == "has" and state == "none":
+                return False
+            if self._annotation == "duplicate" and state != "duplicate":
+                return False
+
+        if self._label is not None:
+            counts = model.labelCounts(image['id'])
+            needed = 2 if self._annotation == "duplicate" else 1
+            if counts.get(self._label, 0) < needed:
+                return False
+
         return True
 
 
@@ -483,6 +604,7 @@ class ImageGridWidget(QWidget):
         
         self.project_id: Optional[int] = None
         self.view_mode = "grid"  # "grid" or "list"
+        self._current_image_id: Optional[int] = None
         
         self.setupUI()
     
@@ -531,7 +653,7 @@ class ImageGridWidget(QWidget):
         
         self.split_filter = QComboBox()
         self.split_filter.addItems(["All", "train", "val", "test"])
-        self.split_filter.currentTextChanged.connect(self.filterImages)
+        self.split_filter.currentTextChanged.connect(self._onFilterComboChanged)
         filter_layout.addWidget(self.split_filter)
         
         self.overlay_check = QPushButton()
@@ -544,6 +666,25 @@ class ImageGridWidget(QWidget):
         
         layout.addLayout(filter_layout)
         
+        # Annotation-state filter (has / no / duplicate labels, per-label)
+        annot_layout = QHBoxLayout()
+        
+        self.annotation_filter = QComboBox()
+        self.annotation_filter.addItem("All images", "all")
+        self.annotation_filter.addItem("Has labels", "has")
+        self.annotation_filter.addItem("No labels", "none")
+        self.annotation_filter.addItem("Duplicate labels", "duplicate")
+        self.annotation_filter.currentIndexChanged.connect(self._onAnnotationFilterChanged)
+        annot_layout.addWidget(self.annotation_filter)
+        
+        self.label_filter = QComboBox()
+        self.label_filter.addItem("Any label", None)
+        self.label_filter.setEnabled(False)
+        self.label_filter.currentIndexChanged.connect(self._onFilterComboChanged)
+        annot_layout.addWidget(self.label_filter)
+        
+        layout.addLayout(annot_layout)
+        
         # Image list view
         self.list_view = QListView()
         self.list_view.setViewMode(QListView.IconMode)
@@ -552,7 +693,6 @@ class ImageGridWidget(QWidget):
         self.list_view.setSpacing(8)
         self.list_view.setUniformItemSizes(True)
         self.list_view.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.list_view.setLayoutMode(QListView.Batched)
         # ScrollPerPixel keeps a stable pixel-based wheel step after the
         # grid <-> list delegate swap. ScrollPerItem collapses singleStep to 1
         # when uniformItemSizes is re-applied, making wheel scrolling crawl.
@@ -578,6 +718,7 @@ class ImageGridWidget(QWidget):
         """Set images to display."""
         self.model.setImages(images)
         self.project_id = images[0]['project_id'] if images else None
+        self._current_image_id = None
 
     def setAnnotationData(
         self,
@@ -591,6 +732,41 @@ class ImageGridWidget(QWidget):
             label_colors=label_colors,
             label_visibility=label_visibility,
         )
+        if label_colors is not None:
+            self._refreshLabelFilter()
+        self.proxy_model.invalidateFilter()
+        # Re-select the current image: annotation changes (save/import/auto) also
+        # reset the view's current index via the re-filter above.
+        if self._current_image_id is not None:
+            self.revealImage(self._current_image_id)
+        self.list_view.viewport().update()
+
+    def _refreshLabelFilter(self):
+        """Populate the per-label filter from the project's labels."""
+        current = self.label_filter.currentData()
+        self.label_filter.blockSignals(True)
+        self.label_filter.clear()
+        self.label_filter.addItem("Any label", None)
+        for label in sorted(self.model.label_colors.keys()):
+            self.label_filter.addItem(label, label)
+        if current is not None:
+            index = self.label_filter.findData(current)
+            if index >= 0:
+                self.label_filter.setCurrentIndex(index)
+        self.label_filter.blockSignals(False)
+        category = self.annotation_filter.currentData()
+        self.label_filter.setEnabled(category in ("has", "duplicate"))
+
+    def _onAnnotationFilterChanged(self, *args):
+        """Enable the label filter only for 'has'/'duplicate', then re-filter."""
+        self._refreshLabelFilter()
+        self.filterImages()
+        self.list_view.setFocus()
+
+    def _onFilterComboChanged(self, *args):
+        """Re-filter after a split/label combo change and return arrow keys to."""
+        self.filterImages()
+        self.list_view.setFocus()
 
     def _onOverlayToggled(self, checked: bool):
         self.model.setShowOverlays(checked)
@@ -627,9 +803,15 @@ class ImageGridWidget(QWidget):
             self.list_view.setItemDelegate(self.list_delegate)
 
     def filterImages(self):
-        """Filter images by search text (name or index) and split."""
+        """Filter images by search text, split, and annotation state."""
         self.proxy_model.setSearch(self.search_input.text())
         self.proxy_model.setSplit(self.split_filter.currentText())
+        self.proxy_model.setAnnotationFilter(self.annotation_filter.currentData())
+        self.proxy_model.setLabelFilter(self.label_filter.currentData())
+        # Keep the current image selected: a filter change resets the view's
+        # current index, which would otherwise leave no image highlighted.
+        if self._current_image_id is not None:
+            self.revealImage(self._current_image_id)
     
     def onItemClicked(self, index: QModelIndex):
         """Handle single click."""
@@ -677,3 +859,33 @@ class ImageGridWidget(QWidget):
                     proxy_idx, 
                     self.list_view.selectionModel().Select | self.list_view.selectionModel().Rows
                 )
+
+    def visibleImageIds(self) -> List[int]:
+        """Image ids in display order, honouring the active filter."""
+        ids = []
+        for row in range(self.proxy_model.rowCount()):
+            proxy_idx = self.proxy_model.index(row, 0)
+            source_idx = self.proxy_model.mapToSource(proxy_idx)
+            image = self.model.getImage(source_idx.row())
+            if image:
+                ids.append(image['id'])
+        return ids
+
+    def revealImage(self, image_id: int):
+        """Select an image and scroll it into view."""
+        self._current_image_id = image_id
+        for row in range(self.proxy_model.rowCount()):
+            proxy_idx = self.proxy_model.index(row, 0)
+            source_idx = self.proxy_model.mapToSource(proxy_idx)
+            image = self.model.getImage(source_idx.row())
+            if image and image['id'] == image_id:
+                self.list_view.setCurrentIndex(proxy_idx)
+                self.list_view.scrollTo(
+                    proxy_idx, self.list_view.ScrollHint.EnsureVisible
+                )
+                return
+
+    def setLastSeen(self, image_id: Optional[int]):
+        """Mark which image the project reopens on."""
+        self.model.setLastSeen(image_id)
+        self.list_view.viewport().update()

@@ -64,6 +64,19 @@ def _cuda_memory_gb(index: int) -> Optional[float]:
         return None
 
 
+def cuda_memory_gb(index: int = 0) -> Optional[float]:
+    """Total VRAM of a CUDA device in GB, or ``None`` when unavailable."""
+    return _cuda_memory_gb(index)
+
+
+def can_run_local_grounding_dino(min_vram_gb: float = 4.0) -> bool:
+    """Whether Grounding DINO can run locally (CUDA with enough VRAM)."""
+    if not _cuda_available():
+        return False
+    memory = _cuda_memory_gb(0)
+    return memory is not None and memory >= min_vram_gb
+
+
 def auto_device_id() -> str:
     """Return the id ``auto`` resolves to on this machine."""
     if _cuda_available():
@@ -73,12 +86,43 @@ def auto_device_id() -> str:
     return DEVICE_CPU
 
 
-def list_devices() -> List[DeviceOption]:
+# Built once per session. Enumerating devices imports torch (about 1.2s), and
+# the auto-annotate dialog needs the list the moment it opens.
+_device_cache: Optional[List["DeviceOption"]] = None
+
+
+def list_devices(*, refresh: bool = False) -> List[DeviceOption]:
     """List the devices a user can pick from, best first.
 
     ``auto`` is always first and reports what it would choose, so the default
     entry is informative rather than opaque.
+
+    The result is cached after the first call; pass ``refresh`` to rebuild it
+    (for example after a driver change).
     """
+    global _device_cache
+    if _device_cache is not None and not refresh:
+        return list(_device_cache)
+    _device_cache = _build_device_list()
+    return list(_device_cache)
+
+
+def prewarm_devices() -> List[DeviceOption]:
+    """Populate the device cache ahead of time.
+
+    Call this off the UI thread once a project is open so opening the
+    auto-annotate dialog does not pay the torch import.
+    """
+    return list_devices(refresh=True)
+
+
+def devices_ready() -> bool:
+    """Whether the device list is already cached."""
+    return _device_cache is not None
+
+
+def _build_device_list() -> List[DeviceOption]:
+    """Enumerate available devices; imports torch as a side effect."""
     options: List[DeviceOption] = []
 
     if _cuda_available():

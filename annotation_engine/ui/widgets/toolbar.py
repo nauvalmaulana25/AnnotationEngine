@@ -54,6 +54,7 @@ class AnnotationToolbar(QToolBar):
             ("bbox", "Bounding Box", "B", "square"),
             ("polygon", "Polygon", "P", "polygon"),
             ("keypoint", "Keypoint", "K", "map-pin"),
+            ("obb", "Oriented Box", "O", "oriented-rectangle"),
         ]
         
         for tool_id, label, shortcut, icon_name in tools:

@@ -364,6 +364,7 @@ class AnnotationCanvas(LabelMeCanvas):
             "keypoint": "point",
             "line": "line",
             "circle": "circle",
+            "oriented_rectangle": "oriented_rectangle",
         }
 
         try:

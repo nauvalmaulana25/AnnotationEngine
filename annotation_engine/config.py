@@ -116,6 +116,7 @@ TOOL_NAMES = {
     'bbox': 'rect',
     'polygon': 'polygon',
     'keypoint': 'point',
+    'obb': 'oriented_rectangle',
 }
 
 # Keyboard shortcuts
@@ -124,6 +125,7 @@ SHORTCUTS = {
     'tool_bbox': 'B',
     'tool_polygon': 'P',
     'tool_keypoint': 'K',
+    'tool_obb': 'O',
     'delete': 'Del',
     'escape': 'Esc',
     'undo': 'Ctrl+Z',

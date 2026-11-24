@@ -75,6 +75,15 @@ check("ultralytics device is a name for cpu",
       not isinstance(dev.ultralytics_device("cpu"), int),
       dev.ultralytics_device("cpu"))
 
+# The device list is cached so the dialog does not pay the torch import twice.
+check("device list is cached after first use", dev.devices_ready())
+first = dev.list_devices()
+second = dev.list_devices()
+check("cached device list is stable",
+      [o.id for o in first] == [o.id for o in second],
+      ([o.id for o in first], [o.id for o in second]))
+check("prewarm rebuilds the cache", bool(dev.prewarm_devices()))
+
 # --------------------------------------------- CUDA out-of-memory fallback
 from annotation_engine.services.mobile_sam import MobileSAMService
 
@@ -95,8 +104,10 @@ class _OomModel:
 
         self.model = _Inner()
 
-    def predict(self, source=None, bboxes=None, device=None, verbose=False):
+    def predict(self, source=None, bboxes=None, device=None, conf=None,
+                verbose=False):
         self.devices.append(device)
+        self.conf = conf
         if device == 0:
             raise _FakeCudaOOM("CUDA out of memory. Tried to allocate 2.00 GiB")
 
@@ -125,6 +136,8 @@ check("oom retries on cpu", _oom_service._model.devices == [0, "cpu"],
 check("oom fallback switches the device", _oom_service.device == "cpu",
       _oom_service.device)
 check("oom fallback still returns masks", len(_masks) == 1, len(_masks))
+check("predict disables ultralytics' own conf filter",
+      _oom_service._model.conf == 0.0, _oom_service._model.conf)
 
 
 class _BoomModel(_OomModel):
@@ -141,6 +154,93 @@ try:
     check("non-oom errors propagate", False, "no exception raised")
 except ValueError:
     check("non-oom errors propagate", True)
+
+# ------------------------------- mask/prompt alignment and skip reporting
+class _AlignedModel:
+    """Predictor returning one mask per box, with per-box confidences."""
+
+    def __init__(self, scores):
+        self.scores = scores
+
+        class _Inner:
+            def to(self, device):
+                pass
+
+        self.model = _Inner()
+
+    def predict(self, source=None, bboxes=None, device=None, conf=None,
+                verbose=False):
+        n = len(bboxes)
+
+        class _Boxes:
+            def __init__(self, scores):
+                self.conf = type("_C", (), {
+                    "cpu": lambda s: s,
+                    "numpy": lambda s: np.array(scores, dtype=np.float32),
+                })()
+
+        class _Masks:
+            data = type("_D", (), {
+                "cpu": lambda s: s,
+                "numpy": lambda s: np.ones((n, 64, 64), np.float32),
+            })()
+
+            def __len__(self):
+                return n
+
+        class _Result:
+            masks = _Masks()
+            boxes = _Boxes(self.scores)
+
+        return [_Result()]
+
+
+_align_service = MobileSAMService(device="cpu")
+_align_service._model = _AlignedModel([0.99, 0.30, 0.99])
+_align_service._model.model.to = lambda d: None
+_align_masks = _align_service.segment_from_boxes(
+    np.zeros((64, 64, 3), np.uint8),
+    [[0, 0, 10, 10], [20, 20, 30, 30], [40, 40, 50, 50]],
+    min_score=0.5,
+)
+check("one mask per box even when filtered",
+      len(_align_masks) == 3, len(_align_masks))
+check("filtered mask is empty, not missing",
+      not _align_masks[1].any() and _align_masks[0].any(),
+      [bool(m.any()) for m in _align_masks])
+check("skipped index is recorded", _align_service.last_skipped == [1],
+      _align_service.last_skipped)
+
+# Prompt indices must stay tied to their own box.
+_align_service._model = _AlignedModel([0.99, 0.10, 0.99])
+_align_service.last_skipped = []
+_masks2 = _align_service.segment_from_boxes(
+    np.zeros((64, 64, 3), np.uint8),
+    [[0, 0, 10, 10], [20, 20, 30, 30], [40, 40, 50, 50]],
+    min_score=0.25,
+)
+check("alignment survives a skip",
+      len(_masks2) == 3 and _align_service.last_skipped == [1],
+      (len(_masks2), _align_service.last_skipped))
+
+# A shortened mask list must not be paired with prompts by position.
+class _ShortModel(_AlignedModel):
+    def predict(self, source=None, bboxes=None, device=None, conf=None,
+                verbose=False):
+        results = super().predict(source, bboxes, device, conf, verbose)
+        # Simulate Ultralytics dropping a mask despite conf=0.
+        results[0].masks.data.numpy = lambda: np.ones((1, 64, 64), np.float32)
+        return results
+
+
+_short = MobileSAMService(device="cpu")
+_short._model = _ShortModel([0.9, 0.9])
+_short_masks = _short.segment_from_boxes(
+    np.zeros((64, 64, 3), np.uint8), [[0, 0, 10, 10], [20, 20, 30, 30]]
+)
+check("short mask list is not misaligned",
+      len(_short_masks) == 2 and not any(m.any() for m in _short_masks),
+      (len(_short_masks), [bool(m.any()) for m in _short_masks]))
 
 # ------------------------------------------------------------ model manager
 from annotation_engine.services import model_manager as mm
@@ -184,17 +284,27 @@ check("tiny speckle is dropped",
 
 # ---------------------------------------------------------------- dialog
 from annotation_engine.ui.dialogs.auto_annotate import (
-    ALL_LABELS, BOX_SOURCE_ALL, BOX_SOURCE_EXISTING, AutoAnnotateDialog,
+    BOX_SOURCE_ALL, BOX_SOURCE_EXISTING, AutoAnnotateDialog,
 )
 
 dialog = AutoAnnotateDialog(labels=["bucket", "arm"], annotated_count=7)
-check("label dropdown has All labels first",
-      dialog.sam_label.itemData(0) == ALL_LABELS,
-      [dialog.sam_label.itemText(i) for i in range(dialog.sam_label.count())])
-check("label dropdown lists project labels",
-      [dialog.sam_label.itemText(i) for i in range(1, dialog.sam_label.count())]
-      == ["bucket", "arm"],
-      [dialog.sam_label.itemText(i) for i in range(dialog.sam_label.count())])
+check("label list offers a checkbox per label",
+      sorted(dialog.sam_label_boxes) == ["arm", "bucket"],
+      list(dialog.sam_label_boxes))
+check("labels default to all checked",
+      sorted(dialog.selectedLabels()) == ["arm", "bucket"],
+      dialog.selectedLabels())
+check("no all-labels entry remains",
+      not hasattr(dialog, "sam_label"), "sam_label still present")
+check("label summary reports the count",
+      "2 of 2" in dialog.sam_label_summary.text(),
+      dialog.sam_label_summary.text())
+
+dialog.sam_label_boxes["arm"].setChecked(False)
+check("unticking a label narrows the selection",
+      dialog.selectedLabels() == ["bucket"], dialog.selectedLabels())
+dialog.sam_label_boxes["arm"].setChecked(True)
+
 check("source offers both options",
       [dialog.sam_source.itemData(i) for i in range(dialog.sam_source.count())]
       == [BOX_SOURCE_EXISTING, BOX_SOURCE_ALL])
@@ -227,11 +337,17 @@ dialog.device_combo.setCurrentIndex(dialog.device_combo.findData(dev.DEVICE_AUTO
 check("remove-boxes option defaults on", dialog.sam_remove_boxes.isChecked())
 
 dialog.setLabels(["bucket", "arm", "tracks"])
-check("setLabels keeps selection", dialog.sam_label.currentData() == ALL_LABELS)
-dialog.sam_label.setCurrentIndex(dialog.sam_label.findData("arm"))
+check("setLabels keeps existing ticks",
+      sorted(dialog.selectedLabels()) == ["arm", "bucket", "tracks"],
+      dialog.selectedLabels())
+dialog.sam_label_boxes["tracks"].setChecked(False)
+dialog.setLabels(["arm", "tracks"])
+check("setLabels preserves unticked labels",
+      dialog.selectedLabels() == ["arm"], dialog.selectedLabels())
 dialog.setLabels(["arm", "bucket"])
-check("setLabels preserves chosen label",
-      dialog.sam_label.currentData() == "arm", dialog.sam_label.currentData())
+check("setLabels drops labels that vanished",
+      sorted(dialog.sam_label_boxes) == ["arm", "bucket"],
+      list(dialog.sam_label_boxes))
 
 # Model status reflects the filesystem.
 dialog.refreshModelStatus()
@@ -247,16 +363,17 @@ else:
     check("download button shown when missing",
           dialog.sam_download_btn.isVisibleTo(dialog))
 
-# Emitted options carry source and label.
+# Emitted options carry source and labels.
 emitted = []
 dialog.runMobileSAM.connect(emitted.append)
 dialog.sam_source.setCurrentIndex(1)
-dialog.sam_label.setCurrentIndex(dialog.sam_label.findData("arm"))
+for label, box in dialog.sam_label_boxes.items():
+    box.setChecked(label == "arm")
 dialog._emitMobileSAM()
 check("run emits once", len(emitted) == 1, emitted)
 if emitted:
     check("run emits source", emitted[0]["source"] == BOX_SOURCE_ALL, emitted[0])
-    check("run emits label", emitted[0]["label"] == "arm", emitted[0])
+    check("run emits a label list", emitted[0]["labels"] == ["arm"], emitted[0])
     check("run emits device", "device" in emitted[0], emitted[0])
     check("run emits remove_boxes", "remove_boxes" in emitted[0], emitted[0])
     check("run emits image ids", "image_ids" in emitted[0], emitted[0])
@@ -336,10 +453,20 @@ check("_shapeBox on polygon uses bounds",
       == [10.0, 20.0, 70.0, 90.0],
       window._shapeBox({"points": [[10, 50], [70, 20], [30, 90]]}))
 check("_shapeBox on empty", window._shapeBox({"points": []}) is None)
-check("label filter matches", window._boxMatchesLabel({"label": "arm"}, "arm"))
-check("label filter rejects", not window._boxMatchesLabel({"label": "bucket"}, "arm"))
-check("all-labels filter accepts",
-      window._boxMatchesLabel({"label": "bucket"}, ALL_LABELS))
+_rect = {"label": "arm", "shape_type": "rectangle", "points": [[0, 0], [10, 10]]}
+_poly = {"label": "arm", "shape_type": "polygon",
+         "points": [[0, 0], [10, 0], [10, 10]]}
+check("label filter matches",
+      window._boxMatchesLabels(_rect, ["arm"]))
+check("label filter rejects",
+      not window._boxMatchesLabels({**_rect, "label": "bucket"}, ["arm"]))
+check("multi-label filter accepts any listed label",
+      window._boxMatchesLabels(_rect, ["arm", "bucket"]))
+check("polygons are never used as prompts",
+      not window._boxMatchesLabels(_poly, ["arm"]),
+      "polygon passed the filter")
+check("empty selection means every label",
+      window._boxMatchesLabels(_rect, []))
 
 
 class FakeService:
@@ -372,7 +499,7 @@ window._mobile_sam = fake
 
 # Run on the current image only, filtered to the "arm" label, keeping boxes.
 window.runMobileSam({
-    "source": BOX_SOURCE_EXISTING, "label": "arm",
+    "source": BOX_SOURCE_EXISTING, "labels": ["arm"],
     "iou_threshold": 0.5, "remove_boxes": False, "image_ids": image_ids,
 })
 wait(600)
@@ -381,21 +508,24 @@ app.processEvents()
 check("one image segmented", len(fake.calls) == 1, fake.calls)
 if fake.calls:
     boxes = fake.calls[0]["boxes"]
-    check("only arm boxes used as prompts", len(boxes) == 2, boxes)
-    check("polygon shape contributes its bounds",
+    # Only the rectangle prompts: the hand-drawn polygon must not feed back in.
+    check("only rectangle prompts are used", len(boxes) == 1, boxes)
+    check("rectangle contributes its bounds",
           [120.0, 20.0, 200.0, 120.0] in boxes, boxes)
+    check("polygon shape is not a prompt",
+          [210.0, 30.0, 260.0, 90.0] not in boxes, boxes)
     check("threshold forwarded", fake.calls[0]["min_score"] == 0.5,
           fake.calls[0]["min_score"])
     check("current image path used",
           fake.calls[0]["path"].endswith("a.png"), fake.calls[0]["path"])
 
 canvas_shapes = window.canvas.getShapesData()
-check("masks appended to canvas", len(canvas_shapes) == 5, len(canvas_shapes))
+check("masks appended to canvas", len(canvas_shapes) == 4, len(canvas_shapes))
 check("appended shapes are polygons",
-      all(s["shape_type"] == "polygon" for s in canvas_shapes[-2:]),
+      all(s["shape_type"] == "polygon" for s in canvas_shapes[-1:]),
       [s["shape_type"] for s in canvas_shapes])
 check("appended shapes inherit the label",
-      all(s["label"] == "arm" for s in canvas_shapes[-2:]),
+      all(s["label"] == "arm" for s in canvas_shapes[-1:]),
       [s["label"] for s in canvas_shapes])
 check("kept source boxes when unchecked",
       len([s for s in canvas_shapes if s["shape_type"] == "rectangle"]) == 2,
@@ -405,7 +535,7 @@ check("result is undoable", window.canvas.canUndo())
 window._flushAutosave()
 app.processEvents()
 check("autosave persisted the masks",
-      len(dbm.get_annotation(image_ids[0])["data"]["shapes"]) == 5,
+      len(dbm.get_annotation(image_ids[0])["data"]["shapes"]) == 4,
       len(dbm.get_annotation(image_ids[0])["data"]["shapes"]))
 
 # ------------------------------------------------- removing source boxes
@@ -431,7 +561,7 @@ window.annotations_dirty = False
 
 fake.calls.clear()
 window.runMobileSam({
-    "source": BOX_SOURCE_EXISTING, "label": ALL_LABELS,
+    "source": BOX_SOURCE_EXISTING, "labels": ["bucket", "arm"],
     "iou_threshold": 0.0, "remove_boxes": True, "image_ids": image_ids,
 })
 wait(600)
@@ -445,8 +575,8 @@ check("removal kept the hand-drawn polygon",
       [210.0, 30.0] in [list(map(float, p)) for p in after[0]["points"]]
       if after and after[0]["shape_type"] == "polygon" else False,
       after_types)
-check("removal added one polygon per box plus the kept hand-drawn one",
-      len([s for s in after if s["shape_type"] == "polygon"]) == 4,
+check("removal added one polygon per rectangle plus the kept hand-drawn one",
+      len([s for s in after if s["shape_type"] == "polygon"]) == 3,
       after_types)
 check("removal is undoable", window.canvas.canUndo())
 window.canvas.undo()
@@ -461,11 +591,31 @@ window._flushAutosave()
 app.processEvents()
 
 # ------------------------------------- all-images scope ignores selection
+# Reset both images to rectangle prompts: earlier steps left image 1 as
+# polygons, which are deliberately never used as prompts.
+for image_id, path in ((image_ids[0], "../images/a.png"),
+                       (image_ids[1], "../images/b.png")):
+    dbm.save_annotation(image_id, {
+        "version": "5.4.1", "flags": {}, "imagePath": path,
+        "imageData": None, "imageHeight": 240, "imageWidth": 320,
+        "shapes": [
+            {"label": "bucket", "points": [[10, 10], [100, 100]],
+             "shape_type": "rectangle", "flags": {}, "group_id": None,
+             "description": "", "mask": None},
+            {"label": "arm", "points": [[120, 20], [200, 120]],
+             "shape_type": "rectangle", "flags": {}, "group_id": None,
+             "description": "", "mask": None},
+        ],
+    })
+window.current_image_id = None
+window.loadImage(image_ids[0])
+app.processEvents()
+
 fake.calls.clear()
 window.annotations_dirty = False
 # The bug: the dialog passes whatever the user clicked, which is never empty.
 window.runMobileSam({
-    "source": BOX_SOURCE_ALL, "label": ALL_LABELS,
+    "source": BOX_SOURCE_ALL, "labels": ["bucket", "arm"],
     "iou_threshold": 0.0, "remove_boxes": False,
     "image_ids": [image_ids[0]],
 })
@@ -484,12 +634,13 @@ check("each box carries its own label",
       [c["labels"] for c in fake.calls])
 
 other = dbm.get_annotation(image_ids[1])["data"]["shapes"]
-check("other image persisted new shapes", len(other) == 2, len(other))
+check("other image persisted new shapes", len(other) == 4, len(other))
 check("other image shapes are polygons",
-      all(s["shape_type"] == "polygon" for s in other[-1:]),
+      all(s["shape_type"] == "polygon" for s in other[-2:]),
       [s["shape_type"] for s in other])
-check("other image keeps its own label",
-      other[-1]["label"] == "bucket", other[-1]["label"])
+check("other image keeps each box's label",
+      sorted(s["label"] for s in other[-2:]) == ["arm", "bucket"],
+      [s["label"] for s in other])
 check("other image label file written",
       (base / "labels" / "b.json").exists())
 
@@ -510,8 +661,85 @@ window.runMobileSam({
 wait(400)
 check("no matching boxes runs nothing", not fake.calls, fake.calls)
 check("no matching boxes explains why",
-      any("No boxes matched" in (t or "") for _, _, t in _message_boxes),
+      any("No rectangles matched" in (t or "") for _, _, t in _message_boxes),
       _message_boxes)
+
+# ------------------------------------------- repeated runs are idempotent
+# Regression: generated polygons used to be re-segmented on every run, and
+# since only rectangles were removable the shape count doubled each time.
+dbm.save_annotation(image_ids[0], {
+    "version": "5.4.1", "flags": {}, "imagePath": "../images/a.png",
+    "imageData": None, "imageHeight": 240, "imageWidth": 320,
+    "shapes": [
+        {"label": "bucket", "points": [[10, 10], [100, 100]],
+         "shape_type": "rectangle", "flags": {}, "group_id": None,
+         "description": "", "mask": None},
+    ],
+})
+window.current_image_id = None
+window.loadImage(image_ids[0])
+app.processEvents()
+
+counts = []
+for _ in range(3):
+    window.runMobileSam({
+        "source": BOX_SOURCE_EXISTING, "labels": ["bucket"],
+        "iou_threshold": 0.0, "remove_boxes": True,
+        "image_ids": [image_ids[0]],
+    })
+    wait(600)
+    app.processEvents()
+    window._flushAutosave()
+    app.processEvents()
+    counts.append(len(dbm.get_annotation(image_ids[0])["data"]["shapes"]))
+
+check("repeated runs do not multiply shapes", counts == [1, 1, 1], counts)
+
+# With source boxes kept, the second run must skip rather than duplicate.
+dbm.save_annotation(image_ids[0], {
+    "version": "5.4.1", "flags": {}, "imagePath": "../images/a.png",
+    "imageData": None, "imageHeight": 240, "imageWidth": 320,
+    "shapes": [
+        {"label": "bucket", "points": [[10, 10], [100, 100]],
+         "shape_type": "rectangle", "flags": {}, "group_id": None,
+         "description": "", "mask": None},
+    ],
+})
+window.current_image_id = None
+window.loadImage(image_ids[0])
+app.processEvents()
+
+kept_counts = []
+for _ in range(2):
+    window.runMobileSam({
+        "source": BOX_SOURCE_EXISTING, "labels": ["bucket"],
+        "iou_threshold": 0.0, "remove_boxes": False,
+        "image_ids": [image_ids[0]],
+    })
+    wait(600)
+    app.processEvents()
+    window._flushAutosave()
+    app.processEvents()
+    kept_counts.append(len(dbm.get_annotation(image_ids[0])["data"]["shapes"]))
+
+check("kept boxes are not segmented twice", kept_counts == [2, 2], kept_counts)
+check("duplicate skip is reported",
+      "already-segmented" in (window.status_bar.currentMessage() or ""),
+      window.status_bar.currentMessage())
+
+# Dedupe must not swallow a genuinely different polygon with the same label.
+existing = [{"label": "bucket", "shape_type": "polygon",
+             "points": [[0, 0], [10, 0], [10, 10], [0, 10]]}]
+check("different geometry is not a duplicate",
+      not window._hasEquivalentPolygon(
+          existing, "bucket", [[500, 500], [520, 500], [520, 520]]),
+      "wrongly treated as duplicate")
+check("same geometry is a duplicate",
+      window._hasEquivalentPolygon(
+          existing, "bucket", [[0, 0], [10, 0], [10, 10], [0, 10]]))
+check("different label is not a duplicate",
+      not window._hasEquivalentPolygon(
+          existing, "wheel", [[0, 0], [10, 0], [10, 10], [0, 10]]))
 
 # ------------------------------------------------------ device plumbing
 check("dialog device choice reaches the service", fake.device_preference == "auto",
@@ -521,6 +749,37 @@ window.mobileSamService(device="cpu")
 check("a new device preference replaces the service",
       not window._mobile_sam is fake, window._mobile_sam)
 check("old service was unloaded", fake.unloaded)
+
+# ------------------------------------------------- project-load warm-up
+# Loading a project must return immediately and warm devices in the background.
+dev._device_cache = None
+check("device cache cleared for the warm-up test", not dev.devices_ready())
+
+import time as _time
+
+_started = _time.perf_counter()
+window.loadProject(project_id)
+_elapsed = _time.perf_counter() - _started
+check("project load does not block on warm-up", _elapsed < 0.5, _elapsed)
+check("warm-up started", window._prewarm_thread is not None,
+      window._prewarm_thread)
+
+_deadline = _time.perf_counter() + 20
+while window._prewarm_thread is not None and _time.perf_counter() < _deadline:
+    wait(50)
+    app.processEvents()
+
+check("warm-up finished", window._prewarm_thread is None)
+check("devices cached after warm-up", dev.devices_ready())
+
+# The dialog must now build without importing torch on the UI thread.
+dialog_fast = AutoAnnotateDialog(project_id=project_id, labels=["a"])
+_started = _time.perf_counter()
+dialog_fast.close()
+dialog_fast = AutoAnnotateDialog(project_id=project_id, labels=["a"])
+_elapsed = _time.perf_counter() - _started
+check("dialog opens quickly once warm", _elapsed < 0.3, _elapsed)
+dialog_fast.close()
 
 window.annotations_dirty = False
 window.close()

@@ -2,12 +2,12 @@
 AnnotationEngine Desktop - Export Dialog
 """
 from pathlib import Path
-from typing import Dict
 
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGroupBox, QLabel,
-    QPushButton, QFileDialog, QCheckBox, QSpinBox, QRadioButton,
-    QLineEdit, QProgressBar, QFormLayout, QMessageBox, QApplication
+    QPushButton, QFileDialog, QCheckBox, QRadioButton,
+    QLineEdit, QProgressBar, QMessageBox, QApplication,
+    QSpinBox, QFormLayout
 )
 from PySide6.QtCore import Qt
 
@@ -47,25 +47,49 @@ class ExportDialog(QDialog):
         
         # Split
         split_group = QGroupBox("Data Split")
-        split_layout = QFormLayout(split_group)
+        split_layout = QVBoxLayout(split_group)
+        
+        self.use_split = QCheckBox("Group by split (train/val/test)")
+        self.use_split.setChecked(True)
+        self.use_split.setToolTip(
+            "Organize images and labels into train/val/test subfolders and "
+            "write a data.yaml for YOLO. Uncheck for a flat labels/ output."
+        )
+        split_layout.addWidget(self.use_split)
+        
+        # Distribution applied to images that were imported without a split.
+        dist_layout = QFormLayout()
+        dist_layout.setContentsMargins(16, 4, 0, 0)
         
         self.split_train = QSpinBox()
         self.split_train.setRange(0, 100)
         self.split_train.setValue(70)
         self.split_train.setSuffix("%")
-        split_layout.addRow("Train:", self.split_train)
+        dist_layout.addRow("Train:", self.split_train)
         
         self.split_val = QSpinBox()
         self.split_val.setRange(0, 100)
         self.split_val.setValue(20)
         self.split_val.setSuffix("%")
-        split_layout.addRow("Val:", self.split_val)
+        dist_layout.addRow("Val:", self.split_val)
         
         self.split_test = QSpinBox()
         self.split_test.setRange(0, 100)
         self.split_test.setValue(10)
         self.split_test.setSuffix("%")
-        split_layout.addRow("Test:", self.split_test)
+        dist_layout.addRow("Test:", self.split_test)
+        
+        dist_note = QLabel(
+            "Percentage of unassigned images to place in each split."
+        )
+        dist_note.setStyleSheet("color: #6b7280; font-size: 12px;")
+        dist_note.setWordWrap(True)
+        dist_layout.addRow("", dist_note)
+        
+        split_layout.addLayout(dist_layout)
+        
+        self.use_split.toggled.connect(self._onUseSplitToggled)
+        self._onUseSplitToggled(self.use_split.isChecked())
         
         layout.addWidget(split_group)
         
@@ -76,6 +100,10 @@ class ExportDialog(QDialog):
         self.include_bbox = QCheckBox("Bounding Boxes")
         self.include_bbox.setChecked(True)
         include_layout.addWidget(self.include_bbox)
+        
+        self.include_obb = QCheckBox("Oriented Boxes")
+        self.include_obb.setChecked(True)
+        include_layout.addWidget(self.include_obb)
         
         self.include_polygon = QCheckBox("Polygons")
         include_layout.addWidget(self.include_polygon)
@@ -133,6 +161,11 @@ class ExportDialog(QDialog):
         path = QFileDialog.getExistingDirectory(self, "Select Output Directory")
         if path:
             self.output_path.setText(path)
+
+    def _onUseSplitToggled(self, checked: bool):
+        """Enable the split-distribution spinboxes only when grouping."""
+        for spin in (self.split_train, self.split_val, self.split_test):
+            spin.setEnabled(checked)
     
     def doExport(self):
         """Run the selected export(s) into the chosen output directory."""
@@ -159,12 +192,6 @@ class ExportDialog(QDialog):
                 return
             output_dir = Path(project['base_path']) / 'exports'
 
-        ratios = {
-            'train': self.split_train.value() / 100,
-            'val': self.split_val.value() / 100,
-            'test': self.split_test.value() / 100,
-        }
-
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.export_btn.setEnabled(False)
@@ -181,8 +208,14 @@ class ExportDialog(QDialog):
             if want_yolo:
                 ok = service.export_yolo(
                     output_dir / 'yolo',
-                    ratios,
+                    use_split=self.use_split.isChecked(),
+                    split_distribution={
+                        'train': self.split_train.value() / 100,
+                        'val': self.split_val.value() / 100,
+                        'test': self.split_test.value() / 100,
+                    },
                     include_bboxes=self.include_bbox.isChecked(),
+                    include_obb=self.include_obb.isChecked(),
                     include_polygons=self.include_polygon.isChecked(),
                     include_keypoints=self.include_keypoints.isChecked(),
                     progress_callback=report,

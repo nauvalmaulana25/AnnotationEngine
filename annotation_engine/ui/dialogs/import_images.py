@@ -69,7 +69,10 @@ class ImportImagesDialog(QDialog):
         options_layout = QFormLayout(options_group)
         
         self.split_combo = QComboBox()
-        self.split_combo.addItems(["train", "val", "test"])
+        self.split_combo.addItem("None", None)
+        self.split_combo.addItem("train", "train")
+        self.split_combo.addItem("val", "val")
+        self.split_combo.addItem("test", "test")
         options_layout.addRow("Default Split:", self.split_combo)
         
         self.recursive_check = QCheckBox("Include subfolders (for folder import)")
@@ -179,7 +182,7 @@ class ImportImagesDialog(QDialog):
             return
         
         # Import each file
-        split = self.split_combo.currentText()
+        split = self.split_combo.currentData()  # None when "None" is chosen
         imported = 0
         
         for src_path in files_to_import:

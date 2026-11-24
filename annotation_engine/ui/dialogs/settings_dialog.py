@@ -10,7 +10,10 @@ from PySide6.QtCore import Qt
 
 from PySide6.QtCore import QSettings
 
-from annotation_engine.core.database import clean_database
+from annotation_engine.core.database import (
+    clean_database, get_setting, set_setting,
+)
+from annotation_engine.utils.encryption import EncryptionManager
 
 
 class SettingsDialog(QDialog):
@@ -23,6 +26,7 @@ class SettingsDialog(QDialog):
         self.setModal(True)
         self.resize(500, 400)
         
+        self.encryption = EncryptionManager()
         self.setupUI()
         self.loadSettings()
     
@@ -142,11 +146,23 @@ class SettingsDialog(QDialog):
         # Models directory
         from annotation_engine.config import MODELS_DIR
         self.models_dir.setText(str(MODELS_DIR))
+        
+        # Hugging Face API key (stored encrypted)
+        self.hf_api_key.setText(
+            self.encryption.decrypt(get_setting('hf_api_key_encrypted', ''))
+        )
     
     def saveSettings(self):
         settings = QSettings()
         settings.setValue("theme", self.theme_combo.currentText().lower())
         settings.setValue("auto_save", self.auto_save.value())
+        
+        # Hugging Face API key (stored encrypted)
+        key = self.hf_api_key.text().strip()
+        set_setting(
+            'hf_api_key_encrypted',
+            self.encryption.encrypt(key) if key else '',
+        )
         self.accept()
     
     def cleanDatabase(self):

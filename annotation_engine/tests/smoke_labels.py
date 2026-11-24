@@ -81,7 +81,7 @@ check("state roundtrip", ll.getLabelState() == [
 ], ll.getLabelState())
 
 item = ll._findItem("dog")
-widget = ll.list_widget.itemWidget(item)
+widget = ll.list_widget.itemWidget(item, 0)
 check("hidden label uses eye-off icon",
       widget.visible_cb.icon().isNull() is False)
 check("hidden label tooltip",
@@ -102,7 +102,7 @@ check("rename updates state", "puppy" in ll.labels and "dog" not in ll.labels)
 check("rename keeps row", ll._findItem("puppy") is not None)
 check("rename emits persist", emitted == [1], emitted)
 check("rename updates widget label",
-      ll.list_widget.itemWidget(ll._findItem("puppy")).label == "puppy")
+      ll.list_widget.itemWidget(ll._findItem("puppy"), 0).label == "puppy")
 
 # rename collision merges and keeps target color
 color = ll.renameLabel("puppy", "cat")
@@ -117,7 +117,7 @@ from PySide6.QtGui import QContextMenuEvent
 
 row_label_hits = []
 ll.showLabelMenu = lambda label, gp: row_label_hits.append(label)
-row_widget = ll.list_widget.itemWidget(ll._findItem("cat"))
+row_widget = ll.list_widget.itemWidget(ll._findItem("cat"), 0)
 for target, target_name in (
     (row_widget.visible_cb, "eye button"),
     (row_widget.color_btn, "color button"),
@@ -133,6 +133,36 @@ for target, target_name in (
     app.processEvents()
     check(f"right-click menus on {target_name}", row_label_hits == ["cat"],
           row_label_hits)
+
+# ------------------------------------------------ per-layer instance rows
+ll2 = LabelListWidget()
+ll2.syncFromShapes([
+    {"label": "cat", "shape_type": "rectangle", "points": [[0, 0], [10, 10]]},
+    {"label": "dog", "shape_type": "rectangle", "points": [[0, 0], [10, 10]]},
+    {"label": "cat", "shape_type": "rectangle", "points": [[20, 20], [30, 30]]},
+    {"label": "cat", "shape_type": "polygon", "points": [[0, 0], [10, 0], [10, 10]]},
+])
+cat_item = ll2._findItem("cat")
+check("overlapping label exposes instance children",
+      cat_item.childCount() == 3, cat_item.childCount())
+check("top layer is Layer 1 (top)",
+      "Layer 1 (top)" in cat_item.child(0).text(0),
+      cat_item.child(0).text(0))
+check("top-first ordering by z-index",
+      [cat_item.child(i).data(0, Qt.UserRole) for i in range(cat_item.childCount())]
+      == [3, 2, 0],
+      [cat_item.child(i).data(0, Qt.UserRole) for i in range(cat_item.childCount())])
+dog_item = ll2._findItem("dog")
+check("single instance gets one child", dog_item.childCount() == 1)
+
+clicks = []
+deletes = []
+ll2.instanceClicked.connect(clicks.append)
+ll2.instanceDeleteRequested.connect(deletes.append)
+ll2.onItemClicked(cat_item.child(1), 0)
+check("clicking an instance emits its index", clicks == [2], clicks)
+ll2.instanceDeleteRequested.emit(2)
+check("instance delete signal carries the index", deletes == [2], deletes)
 
 # ---------------------------------------------------------------- canvas
 from annotation_engine.ui.canvas import AnnotationCanvas
