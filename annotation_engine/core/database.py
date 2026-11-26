@@ -19,6 +19,11 @@ CREATE TABLE IF NOT EXISTS projects (
     name TEXT NOT NULL,
     description TEXT,
     base_path TEXT NOT NULL,
+    remote_host TEXT,
+    remote_port INTEGER,
+    remote_user TEXT,
+    remote_dir TEXT,
+    remote_secret TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -96,7 +101,26 @@ class Database:
         with self.get_connection() as conn:
             conn.executescript(SCHEMA)
             conn.commit()
+        self._migrate()
         logger.info(f"Database initialized at {self.db_path}")
+
+    def _migrate(self):
+        """Apply lightweight, idempotent schema migrations to older databases."""
+        remote_columns = {
+            'remote_host': 'TEXT',
+            'remote_port': 'INTEGER',
+            'remote_user': 'TEXT',
+            'remote_dir': 'TEXT',
+            'remote_secret': 'TEXT',
+        }
+        with self.get_connection() as conn:
+            existing = {
+                row['name'] for row in conn.execute("PRAGMA table_info(projects)")
+            }
+            for column, ddl in remote_columns.items():
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE projects ADD COLUMN {column} {ddl}")
+            conn.commit()
     
     @contextmanager
     def get_connection(self) -> Generator[sqlite3.Connection, None, None]:
@@ -155,6 +179,39 @@ def create_project(name: str, base_path: str, description: str = "") -> int:
     cursor = db.execute(
         "INSERT INTO projects (name, description, base_path, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
         (name, description, str(project_path), now, now)
+    )
+    return cursor.lastrowid
+
+
+def create_remote_project(name: str, cache_path, remote_host: str,
+                          remote_port: int, remote_user: str,
+                          remote_dir: str, remote_secret: str = '',
+                          description: str = "") -> int:
+    """Create a project whose images live on a remote SSH server.
+
+    ``cache_path`` is the local working directory (image cache, labels, exports).
+    The remote connection details are stored on the project row.
+    """
+    from pathlib import Path
+
+    db = get_database()
+    now = datetime.now().isoformat()
+
+    cache_path = Path(cache_path)
+    cache_path.mkdir(parents=True, exist_ok=True)
+    (cache_path / "images").mkdir(exist_ok=True)
+    (cache_path / "labels").mkdir(exist_ok=True)
+    (cache_path / "exports").mkdir(exist_ok=True)
+
+    cursor = db.execute(
+        "INSERT INTO projects (name, description, base_path, remote_host, "
+        "remote_port, remote_user, remote_dir, remote_secret, created_at, "
+        "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            name, description, str(cache_path), remote_host,
+            int(remote_port or 22), remote_user, remote_dir,
+            remote_secret or '', now, now,
+        ),
     )
     return cursor.lastrowid
 

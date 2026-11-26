@@ -3,6 +3,9 @@ AnnotationEngine Desktop - Main Window (Simplified Working Version)
 """
 import os
 import logging
+import posixpath
+import sqlite3
+import tempfile
 from pathlib import Path
 from typing import Optional, List
 
@@ -45,6 +48,7 @@ from annotation_engine.ui.dialogs.settings_dialog import SettingsDialog
 from annotation_engine.ui.dialogs.auto_annotate import AutoAnnotateDialog
 from annotation_engine.ui.dialogs.progress_dialog import ProgressDialog
 from annotation_engine.ui.dialogs.rename_label import RenameLabelDialog
+from annotation_engine.ui.dialogs.ssh_import import SSHImportDialog
 from annotation_engine.ui.canvas import AnnotationCanvas
 from annotation_engine.ui.welcome_window import WelcomeWindow
 from annotation_engine.utils.encryption import EncryptionManager
@@ -57,6 +61,13 @@ from annotation_engine.services.grounding_dino import (
     LocalGroundingDINOService,
     grounding_dino_mode,
 )
+from annotation_engine.services.ssh_client import (
+    SSHClient,
+    SSHConnectionError,
+    decode_secret,
+)
+from annotation_engine.services.thumbnail_prefetcher import ThumbnailPrefetcher
+from annotation_engine.services.export_service import ExportService
 from annotation_engine.services.model_manager import (
     ModelDownloadError,
     download_mobile_sam,
@@ -99,7 +110,11 @@ class MainWindow(QMainWindow):
         self._local_grounding_dino: dict = {}
         self._grounding_dino_job: Optional[str] = None
         self._grounding_dino_mode: Optional[str] = None
+        self._ssh_clients: dict = {}
+        self._prefetcher: Optional[ThumbnailPrefetcher] = None
+        self._prefetch_project_id: Optional[int] = None
         self._auto_annotate_dialog: Optional[AutoAnnotateDialog] = None
+        self._export_dialog = None
         self._managed_jobs: dict = {}
         self._auto_annotate_warmed: bool = False
         self._prewarm_thread: Optional[QThread] = None
@@ -220,6 +235,7 @@ class MainWindow(QMainWindow):
         self.toolbar.importImagesRequested.connect(self.importImages)
         self.toolbar.importLabelsRequested.connect(self.importLabels)
         self.toolbar.exportRequested.connect(self.exportDataset)
+        self.toolbar.syncRequested.connect(self.syncToServer)
         self.toolbar.autoAnnotateRequested.connect(self.showAutoAnnotate)
         self.toolbar.undoRequested.connect(self.undo)
         self.toolbar.redoRequested.connect(self.redo)
@@ -230,6 +246,9 @@ class MainWindow(QMainWindow):
         self.sidebar.imageSelected.connect(self.onImageSelected)
         self.sidebar.imageDoubleClicked.connect(self.onImageDoubleClicked)
         self.sidebar.selectionChanged.connect(self.onSelectionChanged)
+        # Thumbnails for remote (SSH) projects fetch images on demand.
+        self.sidebar.setImageFetcher(self.ensure_local_image)
+        self.sidebar.setPrefetchRequest(self._requestThumbnailPrefetch)
         
         # Canvas signals
         self.canvas.shapeCreated.connect(self.onShapeCreated)
@@ -287,6 +306,11 @@ class MainWindow(QMainWindow):
         open_action.triggered.connect(self.openProject)
         file_menu.addAction(open_action)
         
+        ssh_action = QAction("Connect via &SSH…", self)
+        ssh_action.setStatusTip("Create a project from images on a remote SSH server")
+        ssh_action.triggered.connect(self.connectSSH)
+        file_menu.addAction(ssh_action)
+        
         file_menu.addSeparator()
         
         import_images_action = QAction("Import &Images...", self)
@@ -304,6 +328,11 @@ class MainWindow(QMainWindow):
         export_action.setShortcut(QKeySequence("Ctrl+E"))
         export_action.triggered.connect(self.exportDataset)
         file_menu.addAction(export_action)
+        
+        sync_action = QAction("&Sync to Server", self)
+        sync_action.setStatusTip("Upload annotations and a database snapshot to the SSH server")
+        sync_action.triggered.connect(self.syncToServer)
+        file_menu.addAction(sync_action)
         
         # Manual save. Edits autosave, so this is a safety net rather than the
         # normal way to persist work.
@@ -532,6 +561,7 @@ class MainWindow(QMainWindow):
         
         self.current_project_id = project_id
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} - {project['name']}")
+        self.toolbar.setSshMode(bool(project.get('remote_host')))
         
         # Add to recent
         add_recent_project(project_id)
@@ -642,6 +672,9 @@ class MainWindow(QMainWindow):
         self.current_project_id = None
         self.current_image_id = None
         self._project_images = []
+        self._closeAllSshClients()
+        self._stopPrefetcher()
+        self.toolbar.setSshMode(False)
         self.sidebar.clear()
         self.canvas.clear()
         self._suspend_label_persistence = True
@@ -725,6 +758,222 @@ class MainWindow(QMainWindow):
             label_visibility=visibility,
         )
     
+    # ------------------------------------------------------------------
+    # SSH remote projects
+    # ------------------------------------------------------------------
+    def sshClientForProject(self, project_id: int) -> Optional[SSHClient]:
+        """Return a connected SSH client for a remote project, cached per project."""
+        project = get_project(project_id)
+        if not project or not project.get('remote_host'):
+            return None
+        client = self._ssh_clients.get(project_id)
+        if client is None:
+            password, key_file = decode_secret(project.get('remote_secret') or '')
+            client = SSHClient(
+                project['remote_host'],
+                project.get('remote_port') or 22,
+                project.get('remote_user') or '',
+                password,
+                key_file,
+            )
+            client.connect()
+            self._ssh_clients[project_id] = client
+        return client
+
+    def _newSshClient(self, project_id: int) -> Optional[SSHClient]:
+        """Create a fresh, connected SSH client (for use on a worker thread).
+
+        The prefetcher must not share the main-thread client: paramiko's
+        ``SFTPClient`` is not thread-safe.
+        """
+        project = get_project(project_id)
+        if not project or not project.get('remote_host'):
+            return None
+        password, key_file = decode_secret(project.get('remote_secret') or '')
+        client = SSHClient(
+            project['remote_host'],
+            project.get('remote_port') or 22,
+            project.get('remote_user') or '',
+            password,
+            key_file,
+        )
+        client.connect()
+        return client
+
+    def _closeAllSshClients(self):
+        for client in self._ssh_clients.values():
+            try:
+                client.close()
+            except Exception:
+                pass
+        self._ssh_clients.clear()
+
+    def _remotePathFor(self, image: dict, project: dict) -> str:
+        """Return the full remote path of an image for SFTP."""
+        return posixpath.join(
+            (project.get('remote_dir') or '').replace('\\', '/'),
+            image['relative_path'].replace('\\', '/'),
+        )
+
+    def _prefetcherFor(self, project_id: int) -> ThumbnailPrefetcher:
+        """Return the background thumbnail prefetcher for a remote project."""
+        if self._prefetcher is not None and self._prefetch_project_id == project_id:
+            return self._prefetcher
+        self._stopPrefetcher()
+        self._prefetcher = ThumbnailPrefetcher(
+            lambda: self._newSshClient(project_id), parent=self
+        )
+        self._prefetcher.ready.connect(self._onThumbnailReady)
+        self._prefetcher.failed.connect(self._onThumbnailFailed)
+        self._prefetch_project_id = project_id
+        return self._prefetcher
+
+    def _stopPrefetcher(self):
+        if self._prefetcher is not None:
+            self._prefetcher.stop()
+        self._prefetcher = None
+        self._prefetch_project_id = None
+
+    def _requestThumbnailPrefetch(self, image: dict) -> bool:
+        """Enqueue a background fetch for a remote thumbnail (never blocks)."""
+        project_id = image.get('project_id') or self.current_project_id
+        project = get_project(project_id) if project_id else None
+        if not project or not project.get('remote_host'):
+            return False
+        local_path = os.path.join(project['base_path'], image['relative_path'])
+        if os.path.exists(local_path):
+            return False
+        prefetcher = self._prefetcherFor(project_id)
+        return prefetcher.enqueue(
+            image['id'], self._remotePathFor(image, project), local_path
+        )
+
+    def _backfillDimensions(self, image_id: int, width: int, height: int):
+        """Store an image's real size once known (SSH imports start with NULL)."""
+        if not width or not height:
+            return
+        image = get_image(image_id)
+        if image and (not image.get('width') or not image.get('height')):
+            update_image(image_id, width=width, height=height)
+
+    def _onThumbnailReady(self, image_id: int, local_path: str,
+                          width: int, height: int):
+        self._backfillDimensions(image_id, width, height)
+        if self.sidebar is not None:
+            self.sidebar.invalidateThumbnail(image_id)
+
+    def _onThumbnailFailed(self, image_id: int, error: str):
+        logger.info("Thumbnail prefetch failed for image %s: %s", image_id, error)
+
+    def ensure_local_image(self, image: dict) -> Optional[str]:
+        """Return a local path for an image, fetching it from SSH on demand.
+
+        Local projects are unchanged: the path is returned as-is. Remote
+        projects fetch the file into the local cache the first time it is used.
+        """
+        project_id = image.get('project_id') or self.current_project_id
+        project = get_project(project_id) if project_id else None
+        if not project:
+            return None
+        local_path = os.path.join(project['base_path'], image['relative_path'])
+        if os.path.exists(local_path):
+            self._backfillFromFile(image, local_path)
+            return local_path
+        if not project.get('remote_host'):
+            return local_path  # local project: genuinely missing file
+
+        # Route through the prefetcher so an in-flight thumbnail fetch is reused
+        # and the SSH connection is never used from two threads at once.
+        prefetcher = self._prefetcherFor(project_id)
+        prefetcher.enqueue(
+            image['id'], self._remotePathFor(image, project), local_path
+        )
+        if prefetcher.wait_for(image['id']) and os.path.exists(local_path):
+            self._backfillFromFile(image, local_path)
+            return local_path
+        return None
+
+    def _backfillFromFile(self, image: dict, local_path: str):
+        """Fill in missing width/height for an already-downloaded image."""
+        if image.get('width') and image.get('height'):
+            return
+        try:
+            from PIL import Image
+
+            with Image.open(local_path) as img:
+                self._backfillDimensions(image['id'], img.width, img.height)
+        except Exception:
+            pass
+
+    def connectSSH(self):
+        """Connect to a remote server and open the created project."""
+        dialog = SSHImportDialog(self)
+        if dialog.exec() and dialog.project_id:
+            self.loadProject(dialog.project_id)
+
+    def syncToServer(self):
+        """Upload the project's LabelMe JSON files and a DB snapshot to the server."""
+        if not self.current_project_id:
+            return
+        project = get_project(self.current_project_id)
+        if not project or not project.get('remote_host'):
+            QMessageBox.information(
+                self, "Sync to Server",
+                "This project is not an SSH/remote project.",
+            )
+            return
+
+        self._flushAutosave()
+        self.status_bar.showMessage("Syncing to server…", 0)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        uploaded = 0
+        db_uploaded = False
+        try:
+            client = self.sshClientForProject(self.current_project_id)
+            if client is None:
+                raise SSHConnectionError("Could not connect to the server.")
+
+            labels_dir = Path(project['base_path']) / 'labels'
+            for label_file in sorted(labels_dir.glob('*.json')):
+                remote = posixpath.join(
+                    project['remote_dir'], 'labels', label_file.name
+                )
+                if client.upload(label_file, remote):
+                    uploaded += 1
+
+            # Consistent SQLite snapshot via the backup API (avoids copying a
+            # file that is mid-write).
+            fd, snapshot_str = tempfile.mkstemp(suffix='.db')
+            os.close(fd)
+            snapshot = Path(snapshot_str)
+            try:
+                source = sqlite3.connect(get_database().db_path)
+                target = sqlite3.connect(snapshot)
+                source.backup(target)
+                target.close()
+                source.close()
+                remote_db = posixpath.join(
+                    project['remote_dir'], 'annotation_engine.db'
+                )
+                db_uploaded = client.upload(snapshot, remote_db)
+            finally:
+                snapshot.unlink(missing_ok=True)
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Sync Failed", f"Could not sync to server:\n{exc}"
+            )
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        message = f"Uploaded {uploaded} label file(s)"
+        if db_uploaded:
+            message += " + database snapshot"
+        self.status_bar.showMessage(message, 5000)
+        QMessageBox.information(
+            self, "Sync Complete", message + f"\n\nTo: {project['remote_dir']}"
+        )
+
     # Image management
     def onImageSelected(self, image_id: int):
         """Handle image selection from sidebar."""
@@ -753,10 +1002,16 @@ class MainWindow(QMainWindow):
         if not image:
             return
         
-        image_path = os.path.join(
-            get_project(self.current_project_id)['base_path'],
-            image['relative_path']
-        )
+        image_path = self.ensure_local_image(image)
+        if not image_path or not os.path.exists(image_path):
+            _project = get_project(self.current_project_id)
+            _remote = bool(_project and _project.get('remote_host'))
+            QMessageBox.warning(
+                self, "Error",
+                "The image could not be loaded"
+                + (" (remote fetch failed)." if _remote else "."),
+            )
+            return
         
         if self.canvas.loadImage(image_path):
             self.current_image_id = image_id
@@ -1998,6 +2253,8 @@ class MainWindow(QMainWindow):
             # progress window.
             if self._auto_annotate_dialog is not None:
                 self._auto_annotate_dialog.setProgress(0, "Starting...")
+            if getattr(self, "_export_dialog", None) is not None:
+                self._export_dialog.setServerProgress(0, "Starting…")
             return
         self.showProgressDialog(f"Job {job_id}", "Starting...")
     
@@ -2005,6 +2262,8 @@ class MainWindow(QMainWindow):
         if job_id in self._managed_jobs:
             if self._auto_annotate_dialog is not None:
                 self._auto_annotate_dialog.setProgress(progress, message)
+            if getattr(self, "_export_dialog", None) is not None:
+                self._export_dialog.setServerProgress(progress, message)
             return
         if self.progress_dialog:
             self.progress_dialog.setProgress(progress, message)
@@ -2045,8 +2304,146 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No Project", "Please open a project first.")
             return
         
-        dialog = ExportDialog(self, self.current_project_id)
-        dialog.exec()
+        dialog = ExportDialog(
+            self, self.current_project_id, image_resolver=self.ensure_local_image
+        )
+        dialog.exportToServerRequested.connect(
+            lambda options, d=dialog: self._exportToServer(options, d)
+        )
+        self._export_dialog = dialog
+        try:
+            dialog.exec()
+        finally:
+            self._export_dialog = None
+    
+    def _exportImageResolver(self, project_id: int):
+        """Return a thread-safe image resolver for background exports.
+
+        Runs on a worker thread, so it must not touch the prefetcher (which
+        owns a QThread) or the main-thread SSH client. It keeps one dedicated
+        connection and caches files into the project's local cache dir.
+        """
+        project = get_project(project_id)
+        if not project or not project.get('remote_host'):
+            return self.ensure_local_image
+
+        holder = {'client': None}
+
+        def resolve(image: dict):
+            local_path = os.path.join(project['base_path'], image['relative_path'])
+            if os.path.exists(local_path):
+                return local_path
+            try:
+                if holder['client'] is None:
+                    holder['client'] = self._newSshClient(project_id)
+                client = holder['client']
+                if client is None:
+                    return None
+                remote_path = self._remotePathFor(image, project)
+                if client.fetch(remote_path, local_path):
+                    self._backfillFromFile(image, local_path)
+                    return local_path
+            except Exception as exc:
+                logger.warning("Export fetch failed for %s: %s", image['id'], exc)
+                holder['client'] = None
+            return None
+
+        resolve.close = lambda: (
+            holder['client'].close() if holder['client'] is not None else None
+        )
+        return resolve
+
+    def _exportToServer(self, options: dict, dialog: ExportDialog):
+        """Export into a local staging folder, then upload it to the server."""
+        if not self.current_project_id:
+            return
+        project = get_project(self.current_project_id)
+        if not project or not project.get('remote_host'):
+            dialog.finishServerExport(False, "This project is not an SSH project.")
+            return
+
+        remote_path = (options.get('remote_path') or '').rstrip('/')
+        if not remote_path:
+            dialog.finishServerExport(False, "Enter a remote path.")
+            return
+        project_id = self.current_project_id
+
+        def worker(progress_callback=None):
+            staging = Path(tempfile.mkdtemp(prefix='ae_export_'))
+            resolver = self._exportImageResolver(project_id)
+            try:
+                service = ExportService(project_id, image_resolver=resolver)
+                total_steps = 2
+                step = 0
+
+                def report(percent, message):
+                    if progress_callback:
+                        overall = int(((step + percent / 100) / total_steps) * 100)
+                        progress_callback(overall, message)
+
+                if options.get('want_yolo'):
+                    ok = service.export_yolo(
+                        staging / 'yolo',
+                        use_split=options.get('use_split', True),
+                        split_distribution=options.get('split_distribution'),
+                        include_bboxes=options.get('include_bboxes', True),
+                        include_obb=options.get('include_obb', True),
+                        include_polygons=options.get('include_polygons', False),
+                        include_keypoints=options.get('include_keypoints', False),
+                        progress_callback=report,
+                        output_root_override=remote_path,
+                    )
+                    if not ok:
+                        raise RuntimeError("YOLO export failed")
+                step = 1
+                if options.get('want_labelme'):
+                    ok = service.export_labelme(
+                        staging / 'labelme',
+                        copy_images=True,
+                        progress_callback=report,
+                    )
+                    if not ok:
+                        raise RuntimeError("LabelMe export failed")
+                step = 2
+
+                uploaded = 0
+                client = self._newSshClient(project_id)
+                if client is None:
+                    raise RuntimeError("Could not connect to the server")
+                try:
+                    uploaded = client.upload_tree(
+                        staging, remote_path, progress_callback
+                    )
+                finally:
+                    client.close()
+                return {
+                    'uploaded': uploaded,
+                    'skipped': service.skipped_images,
+                    'remote_path': remote_path,
+                }
+            finally:
+                close = getattr(resolver, 'close', None)
+                if close is not None:
+                    close()
+                import shutil as _shutil
+
+                _shutil.rmtree(staging, ignore_errors=True)
+
+        def on_done(result: dict):
+            message = f"Uploaded {result['uploaded']} file(s) to:\n{result['remote_path']}"
+            if result.get('skipped'):
+                message += f"\n\n{result['skipped']} image(s) could not be fetched and were skipped."
+            dialog.finishServerExport(True, message, result['remote_path'])
+            self.status_bar.showMessage(
+                f"Export uploaded to {result['remote_path']}", 5000
+            )
+
+        def on_error(message: str):
+            dialog.finishServerExport(False, f"Export failed:\n{message}")
+
+        self._runBackgroundJob(
+            'export', worker, on_done, on_error, title="Exporting to server",
+        )
     
     # Settings
     def showSettings(self):
@@ -2137,6 +2534,8 @@ class MainWindow(QMainWindow):
                 return
         
         self._stopPrewarm()
+        self._closeAllSshClients()
+        self._stopPrefetcher()
         app = QApplication.instance()
         if app is not None:
             app.removeEventFilter(self)

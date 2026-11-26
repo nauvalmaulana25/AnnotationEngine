@@ -25,9 +25,11 @@ MODELS_DIR = APP_DATA_DIR / 'models'
 PROJECTS_DIR = Path.home() / 'Documents' / 'AnnotationEngine' / 'Projects'
 LOGS_DIR = APP_DATA_DIR / 'logs'
 ICONS_DIR = Path(__file__).parent / 'resources' / 'icons'
+# Local cache for images pulled from SSH projects (copy-on-demand).
+SSH_CACHE_DIR = APP_DATA_DIR / 'ssh_cache'
 
 # Ensure directories exist
-for d in [APP_DATA_DIR, MODELS_DIR, PROJECTS_DIR, LOGS_DIR]:
+for d in [APP_DATA_DIR, MODELS_DIR, PROJECTS_DIR, LOGS_DIR, SSH_CACHE_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 # Database

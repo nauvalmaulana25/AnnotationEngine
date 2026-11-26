@@ -42,6 +42,12 @@ class ImageGridModel(QAbstractListModel):
         self.show_overlays: bool = True
         # Image the project should reopen on; marked in the delegates.
         self.last_seen_id: Optional[int] = None
+        # Optional callback(image) -> local path, used to fetch remote (SSH)
+        # images on demand when the local cache file is missing.
+        self.image_fetcher = None
+        # Optional callback(image) -> bool, used to enqueue a background fetch
+        # so painting never blocks on network I/O.
+        self.prefetch_request = None
     
     def rowCount(self, parent=QModelIndex()) -> int:
         return len(self.images)
@@ -90,32 +96,6 @@ class ImageGridModel(QAbstractListModel):
     
     def flags(self, index: QModelIndex) -> Qt.ItemFlags:
         return super().flags(index) | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable
-    
-    def getThumbnail(self, image: Dict) -> Optional[QPixmap]:
-        """Get or create thumbnail for image."""
-        image_id = image['id']
-        if image_id in self.thumbnails:
-            return self.thumbnails[image_id]
-        
-        # Generate thumbnail path
-        project = get_project(image['project_id']) if 'project_id' in image else None
-        if project:
-            image_path = os.path.join(project['base_path'], image['relative_path'])
-        else:
-            return None
-        
-        if os.path.exists(image_path):
-            pixmap = QPixmap(image_path)
-            if not pixmap.isNull():
-                thumb = pixmap.scaled(
-                    self.thumbnail_size, 
-                    Qt.KeepAspectRatio, 
-                    Qt.SmoothTransformation
-                )
-                self.thumbnails[image_id] = thumb
-                return thumb
-        
-        return None
     
     def setImages(self, images: List[Dict]):
         """Update images list."""
@@ -170,6 +150,11 @@ class ImageGridModel(QAbstractListModel):
         """Drop a single image's cached overlay so it is recomposed next paint."""
         self.overlays.pop(image_id, None)
 
+    def invalidateThumbnail(self, image_id: int):
+        """Drop a single image's cached thumbnail (e.g. after a remote fetch)."""
+        self.thumbnails.pop(image_id, None)
+        self.overlays.pop(image_id, None)
+
     def getThumbnail(self, image: Dict) -> Optional[QPixmap]:
         """Get or create the base (unannotated) thumbnail for an image."""
         image_id = image['id']
@@ -183,6 +168,25 @@ class ImageGridModel(QAbstractListModel):
         else:
             return None
         
+        if not os.path.exists(image_path):
+            # Never fetch inside paintEvent: a network round-trip per visible
+            # tile would freeze the UI. Enqueue a background fetch instead and
+            # let the delegate show its placeholder until it lands.
+            if self.prefetch_request is not None:
+                try:
+                    self.prefetch_request(image)
+                except Exception:
+                    pass
+                return None
+            # No prefetcher configured: fall back to the blocking fetcher.
+            if self.image_fetcher is not None:
+                try:
+                    fetched = self.image_fetcher(image)
+                except Exception:
+                    fetched = None
+                if fetched:
+                    image_path = fetched
+        
         if os.path.exists(image_path):
             pixmap = QPixmap(image_path)
             if not pixmap.isNull():
@@ -195,6 +199,14 @@ class ImageGridModel(QAbstractListModel):
                 return thumb
         
         return None
+
+    def setImageFetcher(self, fetcher):
+        """Set a callback(image) -> local path for on-demand (SSH) images."""
+        self.image_fetcher = fetcher
+
+    def setPrefetchRequest(self, request):
+        """Set a callback(image) -> bool that enqueues a background fetch."""
+        self.prefetch_request = request
 
     def getOverlayThumbnail(self, image: Dict) -> Optional[QPixmap]:
         """Return the thumbnail with saved annotation shapes drawn on top."""
@@ -256,8 +268,11 @@ class ImageGridModel(QAbstractListModel):
             painter.setPen(pen)
 
             if shape_type == 'point':
+                # A plain 2px dot is nearly invisible at thumbnail scale; draw a
+                # small filled dot with a contrasting outline instead.
                 painter.setBrush(QColor(color))
-                painter.drawEllipse(pts[0], 2, 2)
+                painter.setPen(QPen(QColor(255, 255, 255), 1))
+                painter.drawEllipse(pts[0], 3, 3)
             elif shape_type == 'line':
                 painter.setBrush(Qt.NoBrush)
                 painter.drawLine(pts[0], pts[-1])
@@ -719,6 +734,27 @@ class ImageGridWidget(QWidget):
         self.model.setImages(images)
         self.project_id = images[0]['project_id'] if images else None
         self._current_image_id = None
+
+    def setImageFetcher(self, fetcher):
+        """Set an on-demand image fetch callback for remote projects."""
+        self.model.setImageFetcher(fetcher)
+
+    def setPrefetchRequest(self, request):
+        """Set a background prefetch callback so painting never blocks."""
+        self.model.setPrefetchRequest(request)
+
+    def invalidateThumbnail(self, image_id: int):
+        """Drop a cached thumbnail and repaint that row (after a fetch)."""
+        self.model.invalidateThumbnail(image_id)
+        for row in range(self.proxy_model.rowCount()):
+            proxy_idx = self.proxy_model.index(row, 0)
+            source_idx = self.proxy_model.mapToSource(proxy_idx)
+            image = self.model.getImage(source_idx.row())
+            if image and image['id'] == image_id:
+                self.model.dataChanged.emit(
+                    source_idx, source_idx, [Qt.DecorationRole]
+                )
+                return
 
     def setAnnotationData(
         self,

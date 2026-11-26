@@ -19,7 +19,7 @@ from annotation_engine.utils.file_ops import build_labelme_payload, write_labelm
 class ExportService:
     """Export annotations to YOLO and COCO formats."""
     
-    def __init__(self, project_id: int):
+    def __init__(self, project_id: int, image_resolver=None):
         self.project_id = project_id
         self.project = get_project(project_id)
         if not self.project:
@@ -28,6 +28,24 @@ class ExportService:
         self.base_path = Path(self.project['base_path'])
         self.images = get_project_images(project_id)
         self.image_map = {img['id']: img for img in self.images}
+        # Optional callback(image) -> local path, used for SSH projects whose
+        # images are only cached on demand.
+        self.image_resolver = image_resolver
+        self.skipped_images = 0
+
+    def _resolveImageSource(self, image: dict) -> Optional[Path]:
+        """Return a local path for an image, fetching it on demand if needed."""
+        local = self.base_path / image['relative_path']
+        if local.exists():
+            return local
+        if self.image_resolver is not None:
+            try:
+                resolved = self.image_resolver(image)
+            except Exception:
+                resolved = None
+            if resolved and Path(resolved).exists():
+                return Path(resolved)
+        return None
     
     def _get_category_mapping(self, include_polygons: bool, include_keypoints: bool,
                               include_obb: bool) -> Dict:
@@ -124,7 +142,8 @@ class ExportService:
         include_obb: bool = True,
         include_polygons: bool = True,
         include_keypoints: bool = True,
-        progress_callback: Optional[callable] = None
+        progress_callback: Optional[callable] = None,
+        output_root_override: Optional[str] = None
     ) -> bool:
         """
         Export annotations in YOLO format.
@@ -167,7 +186,9 @@ class ExportService:
             # Write data.yaml (only when grouping by split), listing only the
             # splits that actually receive images.
             if use_split:
-                data_yaml = {'path': str(output_dir.absolute())}
+                data_yaml = {
+                    'path': output_root_override or str(output_dir.absolute())
+                }
                 for split in ('train', 'val', 'test'):
                     if split in split_by_id.values():
                         data_yaml[split] = f'images/{split}'
@@ -198,7 +219,12 @@ class ExportService:
                     lbl_dst_dir = labels_root
                 
                 # Copy image
-                src = self.base_path / image['relative_path']
+                src = self._resolveImageSource(image)
+                if src is None:
+                    # Remote image that could not be fetched: skip rather than
+                    # abort the whole export.
+                    self.skipped_images += 1
+                    continue
                 dst = img_dst_dir / image['filename']
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
@@ -323,10 +349,12 @@ class ExportService:
                     )
 
                 if copy_images:
-                    src = self.base_path / image['relative_path']
+                    src = self._resolveImageSource(image)
                     dst = images_dir / image['filename']
-                    if src.exists():
+                    if src is not None:
                         shutil.copy2(src, dst)
+                    else:
+                        self.skipped_images += 1
 
                 annotation = get_annotation(image['id'])
                 shapes = annotation['data'].get('shapes', []) if annotation else []

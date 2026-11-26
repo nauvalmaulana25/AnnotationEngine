@@ -13,6 +13,7 @@ pyyaml>=6.0.1
 cryptography>=41.0.0
 requests>=2.31.0
 tqdm>=4.66.0
+paramiko>=3.4.0
 
 # LabelMe dependencies (when vendored, these are included in labelme folder)
 # PySide6 already covers Qt dependencies

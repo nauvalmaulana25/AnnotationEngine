@@ -158,6 +158,92 @@ check("distribution is deterministic",
       train_count == len(list((TMP / "out_dist2" / "labels" / "train").glob("*.txt")))
       and val_count == len(list((TMP / "out_dist2" / "labels" / "val").glob("*.txt"))))
 
+
+# --------------------------------------- remote images + output root override
+pid3 = dbm.create_remote_project(
+    "RemoteExport", TMP / "remote_cache", "127.0.0.1", 22, "u", "/data"
+)
+remote_base = Path(dbm.get_project(pid3)["base_path"])
+remote_base.mkdir(parents=True, exist_ok=True)
+missing_id = dbm.add_image(pid3, "r.png", "r.png", 10, 10, 0, "train")
+dbm.save_annotation(missing_id, {
+    "version": "5.4.1", "flags": {}, "imagePath": "../r.png",
+    "imageData": None, "imageHeight": 10, "imageWidth": 10,
+    "shapes": [{"label": "box", "shape_type": "rectangle",
+                "points": [[1, 1], [9, 9]], "flags": {}, "group_id": None,
+                "description": "", "mask": None}],
+})
+
+fetched = []
+
+
+def _resolver(image):
+    """Stand-in for the SSH on-demand fetch: writes the file and returns it."""
+    target = remote_base / image["relative_path"]
+    pm = QPixmap(10, 10)
+    pm.fill(QColor("white"))
+    pm.save(str(target))
+    fetched.append(image["id"])
+    return str(target)
+
+
+svc3 = ExportService(pid3, image_resolver=_resolver)
+out_remote = TMP / "out_remote"
+ok = svc3.export_yolo(
+    out_remote, use_split=True, output_root_override="/srv/dataset",
+)
+check("remote export succeeds via resolver", ok, ok)
+check("resolver fetched the image", fetched == [missing_id], fetched)
+check("remote image copied into export",
+      (out_remote / "images" / "train" / "r.png").exists())
+
+data_remote = _yaml.safe_load((out_remote / "data.yaml").read_text())
+check("data.yaml path uses the remote override",
+      data_remote["path"] == "/srv/dataset", data_remote["path"])
+
+# An image that cannot be resolved is skipped, not fatal.
+missing2 = dbm.add_image(pid3, "missing2.png", "missing2.png", 10, 10, 0, "train")
+pid4 = dbm.create_remote_project(
+    "RemoteSkip", TMP / "remote_cache2", "127.0.0.1", 22, "u", "/data2"
+)
+dbm.add_image(pid4, "nope.png", "nope.png", 10, 10, 0, "train")
+svc4 = ExportService(pid4, image_resolver=lambda image: None)
+out_skip = TMP / "out_skip"
+ok = svc4.export_yolo(out_skip, use_split=True)
+check("unresolvable image does not fail the export", ok, ok)
+check("unresolvable image counted as skipped", svc4.skipped_images == 1,
+      svc4.skipped_images)
+
+
+# ------------------------------------------------ server export dialog UI
+from annotation_engine.ui.dialogs.export_dialog import ExportDialog
+
+local_dialog = ExportDialog(project_id=pid2)
+check("server option hidden for local project",
+      not local_dialog.output_server.isVisibleTo(local_dialog))
+local_dialog.close()
+
+remote_dialog = ExportDialog(project_id=pid3)
+check("server option visible for SSH project",
+      remote_dialog.output_server.isVisibleTo(remote_dialog))
+check("server path defaults to <remote_dir>/exports",
+      remote_dialog.server_path.text() == "/data/exports",
+      remote_dialog.server_path.text())
+
+emitted = []
+remote_dialog.exportToServerRequested.connect(emitted.append)
+remote_dialog.output_server.setChecked(True)
+remote_dialog.doExport()
+check("server export emits options", len(emitted) == 1, emitted)
+if emitted:
+    payload = emitted[0]
+    check("emit carries remote path", payload.get("remote_path") == "/data/exports",
+          payload.get("remote_path"))
+    check("emit carries format flags", "want_yolo" in payload and "want_labelme" in payload)
+    check("emit carries split options", "use_split" in payload
+          and "split_distribution" in payload)
+remote_dialog.close()
+
 print()
 if failures:
     print(f"FINAL_EXPORT_FAILED: {failures}")

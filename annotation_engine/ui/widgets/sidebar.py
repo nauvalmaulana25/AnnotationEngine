@@ -42,6 +42,18 @@ class SidebarWidget(QWidget):
         """Set images in grid."""
         self.image_grid.setImages(images)
 
+    def setImageFetcher(self, fetcher):
+        """Set an on-demand image fetch callback for remote (SSH) projects."""
+        self.image_grid.setImageFetcher(fetcher)
+
+    def setPrefetchRequest(self, request):
+        """Set a background prefetch callback so painting never blocks."""
+        self.image_grid.setPrefetchRequest(request)
+
+    def invalidateThumbnail(self, image_id: int):
+        """Drop a cached thumbnail so it is regenerated from the local file."""
+        self.image_grid.invalidateThumbnail(image_id)
+
     def setAnnotationData(
         self,
         annotations: Dict[int, List[dict]] = None,

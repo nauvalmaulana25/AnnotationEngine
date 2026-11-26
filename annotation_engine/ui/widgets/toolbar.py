@@ -27,6 +27,7 @@ class AnnotationToolbar(QToolBar):
     importImagesRequested = Signal()
     importLabelsRequested = Signal()
     exportRequested = Signal()
+    syncRequested = Signal()
     autoAnnotateRequested = Signal()
     undoRequested = Signal()
     redoRequested = Signal()
@@ -96,6 +97,13 @@ class AnnotationToolbar(QToolBar):
         export_action.setToolTip("Export Dataset (Ctrl+E)")
         export_action.triggered.connect(self.exportRequested)
         self.addAction(export_action)
+        
+        # SSH-only: hidden entirely for local projects (see setSshMode).
+        self.sync_action = QAction(_icon("upload-cloud.svg"), "Sync to SSH", self)
+        self.sync_action.setToolTip("Upload annotations and a database snapshot to the server")
+        self.sync_action.triggered.connect(self.syncRequested)
+        self.sync_action.setVisible(False)
+        self.addAction(self.sync_action)
         
         self.addSeparator()
         
@@ -172,6 +180,10 @@ class AnnotationToolbar(QToolBar):
             self.undo_action.setEnabled(False)
             self.redo_action.setEnabled(False)
             self.delete_action.setEnabled(False)
+    
+    def setSshMode(self, enabled: bool):
+        """Show the Sync button only for SSH (remote) projects."""
+        self.sync_action.setVisible(bool(enabled))
     
     def setSelectionCount(self, count: int):
         """Update selection count label."""

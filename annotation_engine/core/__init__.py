@@ -4,6 +4,7 @@ AnnotationEngine Desktop - Core Package
 from .database import (
     get_database,
     create_project,
+    create_remote_project,
     get_project,
     get_all_projects,
     update_project,
@@ -29,6 +30,7 @@ from .database import (
 __all__ = [
     'get_database',
     'create_project',
+    'create_remote_project',
     'get_project',
     'get_all_projects',
     'update_project',

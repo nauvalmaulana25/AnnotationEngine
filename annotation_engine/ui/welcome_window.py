@@ -146,6 +146,23 @@ class WelcomeWindow(QDialog):
         self.open_btn.clicked.connect(self.openExistingProject)
         actions_layout.addWidget(self.open_btn)
         
+        self.ssh_btn = QPushButton("Connect via SSH")
+        self.ssh_btn.setFixedHeight(48)
+        self.ssh_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #f3f4f6;
+                color: #374151;
+                border: 1px solid #d1d5db;
+                border-radius: 10px;
+                font-size: 16px;
+                font-weight: 500;
+            }
+            QPushButton:hover { background-color: #e5e7eb; border-color: #9ca3af; }
+            QPushButton:pressed { background-color: #d1d5db; }
+        """)
+        self.ssh_btn.clicked.connect(self.connectSSH)
+        actions_layout.addWidget(self.ssh_btn)
+        
         layout.addLayout(actions_layout)
         
         # ===== SEPARATOR =====
@@ -357,6 +374,15 @@ class WelcomeWindow(QDialog):
                 "The selected folder is not an AnnotationEngine project.\n"
                 "Please select a valid project directory."
             )
+
+    @Slot()
+    def connectSSH(self):
+        """Create a remote project from images on an SSH server."""
+        from annotation_engine.ui.dialogs.ssh_import import SSHImportDialog
+
+        dialog = SSHImportDialog(self)
+        if dialog.exec() and dialog.project_id:
+            self.openProject(dialog.project_id)
     
     @Slot(QListWidgetItem)
     def onRecentItemDoubleClicked(self, item: QListWidgetItem):

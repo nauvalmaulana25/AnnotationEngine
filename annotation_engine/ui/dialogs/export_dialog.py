@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
     QLineEdit, QProgressBar, QMessageBox, QApplication,
     QSpinBox, QFormLayout
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 
 from annotation_engine.core.database import get_project
 from annotation_engine.services.export_service import ExportService
@@ -18,14 +18,21 @@ from annotation_engine.services.export_service import ExportService
 class ExportDialog(QDialog):
     """Dialog for exporting dataset."""
     
-    def __init__(self, parent=None, project_id=None):
+    # Emitted when the user chooses to export to the SSH server instead of a
+    # local directory. The main window performs the work in the background.
+    exportToServerRequested = Signal(dict)
+    
+    def __init__(self, parent=None, project_id=None, image_resolver=None):
         super().__init__(parent)
         
         self.project_id = project_id
+        self.project = get_project(project_id) if project_id else None
+        self.is_remote = bool(self.project and self.project.get('remote_host'))
+        self.image_resolver = image_resolver
         
         self.setWindowTitle("Export Dataset")
         self.setModal(True)
-        self.resize(500, 500)
+        self.resize(500, 560)
         
         self.setupUI()
     
@@ -135,6 +142,41 @@ class ExportDialog(QDialog):
         
         output_layout.addLayout(path_layout)
         
+        # SSH-only: write the export straight to the server.
+        self.output_server = QRadioButton("Save to server (SSH)")
+        self.output_server.setToolTip(
+            "Export locally into a temporary folder, then upload it to the "
+            "remote path below."
+        )
+        output_layout.addWidget(self.output_server)
+        
+        server_path_layout = QHBoxLayout()
+        self.server_path = QLineEdit()
+        self.server_path.setEnabled(False)
+        if self.is_remote:
+            remote_dir = (self.project.get('remote_dir') or '').rstrip('/')
+            self.server_path.setText(f"{remote_dir}/exports" if remote_dir else "/exports")
+        server_path_layout.addWidget(self.server_path)
+        output_layout.addLayout(server_path_layout)
+        
+        if self.is_remote:
+            server_note = QLabel(
+                "Remote path on the SSH server. Images are uploaded too."
+            )
+        else:
+            server_note = QLabel(
+                "Only available for SSH projects."
+            )
+            self.output_server.setEnabled(False)
+            self.output_server.setVisible(False)
+            self.server_path.setVisible(False)
+        server_note.setStyleSheet("color: #6b7280; font-size: 12px;")
+        server_note.setWordWrap(True)
+        output_layout.addWidget(server_note)
+        
+        self.output_server.toggled.connect(self._onOutputModeChanged)
+        self.output_custom.toggled.connect(self._onOutputModeChanged)
+        
         layout.addWidget(output_group)
         
         # Progress
@@ -167,6 +209,28 @@ class ExportDialog(QDialog):
         for spin in (self.split_train, self.split_val, self.split_test):
             spin.setEnabled(checked)
     
+    def _onOutputModeChanged(self, *args):
+        """Enable the matching path field for the chosen output mode."""
+        self.output_path.setEnabled(self.output_custom.isChecked())
+        self.server_path.setEnabled(self.output_server.isChecked())
+    
+    def _exportOptions(self) -> dict:
+        """Collect the format/split/include choices shared by both targets."""
+        return {
+            'want_yolo': self.format_yolo.isChecked(),
+            'want_labelme': self.format_labelme.isChecked(),
+            'use_split': self.use_split.isChecked(),
+            'split_distribution': {
+                'train': self.split_train.value() / 100,
+                'val': self.split_val.value() / 100,
+                'test': self.split_test.value() / 100,
+            },
+            'include_bboxes': self.include_bbox.isChecked(),
+            'include_obb': self.include_obb.isChecked(),
+            'include_polygons': self.include_polygon.isChecked(),
+            'include_keypoints': self.include_keypoints.isChecked(),
+        }
+    
     def doExport(self):
         """Run the selected export(s) into the chosen output directory."""
         if not self.project_id:
@@ -177,6 +241,21 @@ class ExportDialog(QDialog):
         want_labelme = self.format_labelme.isChecked()
         if not want_yolo and not want_labelme:
             QMessageBox.warning(self, "Export", "Select at least one format.")
+            return
+
+        # SSH projects may export straight to the server; the main window runs
+        # that in the background and reports back through the progress bar.
+        if self.is_remote and self.output_server.isChecked():
+            remote_path = self.server_path.text().strip()
+            if not remote_path:
+                QMessageBox.warning(self, "Export", "Enter a remote path.")
+                return
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setValue(0)
+            self.export_btn.setEnabled(False)
+            self.exportToServerRequested.emit({
+                **self._exportOptions(), 'remote_path': remote_path,
+            })
             return
 
         if self.output_custom.isChecked():
@@ -202,7 +281,7 @@ class ExportDialog(QDialog):
             self.progress_bar.setFormat(f"{message} (%p%)")
             QApplication.processEvents()
 
-        service = ExportService(self.project_id)
+        service = ExportService(self.project_id, image_resolver=self.image_resolver)
         ok = True
         try:
             if want_yolo:
@@ -239,3 +318,23 @@ class ExportDialog(QDialog):
             QMessageBox.critical(
                 self, "Export", "Export failed. Check the log for details."
             )
+    
+    # ------------------------------------------------------------------
+    # Server export (driven by the main window)
+    # ------------------------------------------------------------------
+    def setServerProgress(self, percent: int, message: str = ""):
+        """Update the progress bar while a server export runs."""
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(int(percent))
+        if message:
+            self.progress_bar.setFormat(f"{message} (%p%)")
+    
+    def finishServerExport(self, ok: bool, message: str, remote_path: str = ""):
+        """Close out a server export, reporting success or failure."""
+        self.progress_bar.setVisible(False)
+        self.export_btn.setEnabled(True)
+        if ok:
+            QMessageBox.information(self, "Export", message)
+            self.accept()
+        else:
+            QMessageBox.critical(self, "Export", message)
